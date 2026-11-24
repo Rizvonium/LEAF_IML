@@ -109,6 +109,7 @@ import numpy as np, pandas as pd, matplotlib.pyplot as plt
 import torch, torch.nn as nn, torch.nn.functional as F
 import torchvision
 from torchvision.transforms.v2 import functional as TF
+from torchvision.transforms import InterpolationMode
 from PIL import Image
 
 DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -258,7 +259,7 @@ def rotate_shift(x, angle, tx=0, ty=0, flip=False):
     # difference from it, so the corners uncovered by the rotation (zero-filled) become exactly that colour.
     bg = x[:, :1, :1]
     x = TF.affine(x - bg, angle=angle, translate=[tx, ty], scale=1.0, shear=[0.0, 0.0],
-                  interpolation=TF.InterpolationMode.BILINEAR) + bg
+                  interpolation=InterpolationMode.BILINEAR) + bg
     x = x.clamp(0, 1)
     return TF.horizontal_flip(x) if flip else x
 
@@ -571,6 +572,16 @@ for j, (s, k) in enumerate(shown):
 for a in axes.flat: a.axis('off')
 plt.suptitle('Errors: as seen (top), same leaf upright (middle), a training leaf of the predicted species (bottom)')
 plt.tight_layout(); plt.show()
+
+# Over all errors of all 3 seeds: is the same leaf classified correctly when upright?
+ORIENT_ERR, ALL_ERR = 0, 0
+for s, p in enumerate(preds):
+    wrong = np.where(p != yv)[0]
+    if len(wrong):
+        up = predict_proba(P3['models'][s], val_x[wrong], tta=True).argmax(1).cpu().numpy()
+        ORIENT_ERR += int((up == yv[wrong]).sum()); ALL_ERR += len(wrong)
+print(f'of {ALL_ERR} errors (3 seeds pooled), {ORIENT_ERR} are classified correctly when the leaf is upright '
+      f'(errors caused by orientation); {ALL_ERR - ORIENT_ERR} are wrong even upright (caused by the leaf itself)')
 """)
 md(r"""
 **Interpretation of the confusion matrix and the errors:** see section 8, written from the outputs above.
@@ -615,6 +626,19 @@ print(f"Augmentation effect, ResNet-18 (P1 -> P2), rotated val: {ms(R['P1']['val
 print(f"Small CNN final (E11) vs ResNet-18 final (P3), rotated val: {ms(R['E11']['val_rot'])} vs {ms(R['P3']['val_rot'])}")
 print('Most frequent confusions of the final config:', CONFUSIONS[:4])
 print(f'Total run time: {(time.time() - T_START) / 60:.1f} min')
+
+first_learns = next((s for s in steps if np.mean(R[s]['val']) > 0.3), None)
+print('\nWhat the numbers say:')
+print(f"* The starter does not learn: train {np.mean(STARTER_TRAIN):.3f}, validation {np.mean(STARTER_VAL):.3f}, chance {1/15:.3f}.")
+print(f"* More updates alone: E1 {np.mean(R['E1']['val']):.3f}, E2 {np.mean(R['E2']['val']):.3f} (validation). "
+      f"First row with validation accuracy above 0.3: {first_learns} ({LOG[steps.index(first_learns)]['change'] if first_learns else '-'}).")
+print(f"* Without rotation augmentation (E6), upright vs rotated validation: {np.mean(R['E6']['val']):.3f} vs {np.mean(R['E6']['val_rot']):.3f}. "
+      f"With it (E7), rotated validation: {np.mean(R['E7']['val_rot']):.3f}.")
+print(f"* Pretrained ResNet-18 without augmentation (P1), upright vs rotated: {np.mean(R['P1']['val']):.3f} vs {np.mean(R['P1']['val_rot']):.3f}; "
+      f"with augmentation (P2) rotated: {np.mean(R['P2']['val_rot']):.3f}; with TTA (P3): {np.mean(R['P3']['val_rot']):.3f}.")
+print(f"* Starter's small CNN after all changes (E11), rotated validation: {ms(R['E11']['val_rot'])}.")
+print(f"* Final errors: {ALL_ERR} over 3 seeds x 120 images, {ORIENT_ERR} of them due to orientation; most confused pairs: "
+      + ', '.join(f'{a[-2:]}->{b[-2:]} ({n})' for n, a, b in CONFUSIONS[:3]) + '.')
 """)
 md(r"""
 *(Written interpretation: added after the Colab run.)*
