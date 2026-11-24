@@ -621,7 +621,12 @@ print(f'{ERR_STEP}: of {ALL_ERR} errors (3 seeds pooled), {ORIENT_ERR} are class
       f'(errors caused by orientation); {ALL_ERR - ORIENT_ERR} are wrong even upright (caused by the leaf itself)')
 """)
 md(r"""
-**Interpretation of the confusion matrix and the errors:** see section 8, written from the outputs above.
+**Interpretation of the confusion matrices and the errors**
+* **Final model (P3):** all 120 rotated validation leaves are classified correctly with every seed, so its confusion matrix is purely diagonal. On the test set the three final models disagree on only about 0.6% of images (pairwise agreement 0.994). Those few leaves are the hard cases; a perfect validation score does not guarantee a perfect test score.
+* **Starter's small CNN after all changes (E11):** 12.3 ± 0.6 errors per seed out of 120 (about 10%). The errors fall in a few pairs: species_09 → species_11 (9 over the 3 seeds), species_01 ↔ species_03 (7 + 6), and a few leaves predicted as species_15.
+* **Why these pairs:** they look alike. Species_01 and species_03 are both ovate, with toothed margins and many straight, parallel side veins; they differ mainly in width. Species_09 and species_11 are both elliptic with a pointed tip. The panels also show some species_01 leaves with a folded or curled base, which hides part of the outline.
+* **Orientation vs the leaf itself:** only 6 of the 37 E11 errors disappear when the same leaf is shown upright (middle row). So after augmentation, the small CNN's remaining mistakes come mostly from the leaves (similar shape, damage), not from orientation.
+* **Why the pretrained ResNet-18 does better:** its ImageNet features already encode fine texture and edge detail (margin teeth, vein patterns). A 3-layer network trained from scratch on 480 images cannot learn these as reliably.
 
 ### Predictions for the test set
 The final configuration is retrained on **all 600 labelled images** with each of the 3 seeds: same settings, no validation hold-out, so there is no validation number for these exact models (P3 is their estimate). The test prediction averages the 3 models' TTA probabilities. How often the seeds agree with each other shows how stable the predictions are.
@@ -679,7 +684,25 @@ print(f"* Small CNN (E11) most confused pairs (count over 3 seeds): " + ', '.joi
       + f"; of the {ERR_STEP} errors, {ORIENT_ERR} of {ALL_ERR} disappear when the leaf is upright.")
 """)
 md(r"""
-*(Written interpretation: added after the Colab run.)*
+### Written summary
+*(Outputs in this copy come from a run on a Kaggle T4 GPU, because no Colab GPU was available that evening. The notebook runs unchanged on a Colab T4. This run took 14.9 minutes.)*
+
+**What was wrong with the starter.** Run unchanged, it does not learn: train 0.067 ± 0.004 and validation 0.067 ± 0.014 over 3 seeds, which is chance (1/15). It predicts species_11 for every test image. With batch size 256 on 480 images it makes only 10 plain-SGD updates in total. Its input is shrunk to 64 px, it is neither standardised nor batch-normalised, and its validation split is unstratified (3 to 15 images per class).
+
+**What I found in the data.** Training leaves are upright: 92% have their long axis within 30° of vertical, and the stem points down in most of them. Test leaves are rotated about the image centre to every angle: 33% are near vertical, and among those the stem points down only about half the time. Leaf size, position (distance from the centre), colour, background and sharpness are the same in both sets. So I trained with 360° rotation and mirroring, and estimated test accuracy on a rotated copy of the validation set. The rotation uses bicubic interpolation: bilinear lowered the measured sharpness from 0.131 to 0.093, bicubic only to 0.117, closer to the test images' 0.131.
+
+**Effect of each change** (rotated validation, mean ± sd over 3 seeds; full table in the experiment log):
+* E1 batch 32 and E2 40 epochs (more updates): still near chance (validation 0.089 and 0.106). More updates alone are not enough.
+* **E3 Adam is the first change that makes it learn:** validation 0.639 ± 0.059.
+* E4 128 px: no measurable gain for the small CNN (0.567 ± 0.046, within noise). E5 standardisation: 0.731 ± 0.041 upright.
+* E6 batch norm: 0.786 upright but only 0.558 rotated, with a large spread between seeds. The accuracy-vs-rotation plot shows why: without augmentation, accuracy peaks for upright leaves and drops to about 0.37 at ±90°.
+* **E7 rotation augmentation:** rotated accuracy becomes flat across all angles (0.631 ± 0.168 at 40 epochs). Upright and rotated accuracy then track each other in the learning curves.
+* E8 80 epochs: 0.864 ± 0.017. E9 cosine decay: 0.864 ± 0.010 (same mean, smaller spread). E10 width 32: 0.906 ± 0.010. E11 TTA: 0.897 ± 0.005 (no further gain).
+* **Pretrained ResNet-18:** without augmentation (P1) it is perfect upright (1.000) but only 0.783 ± 0.017 rotated, so pretraining alone does not solve the rotation problem. With augmentation (P2) it reaches 0.997 ± 0.005; with TTA (P3), 1.000 ± 0.000.
+
+**Final model and test predictions.** The final model is the P3 configuration retrained on all 600 images with 3 seeds, its predictions averaged with TTA. The seeds agree on 99.4% of test images, and the predicted counts are balanced (34 to 36 per species out of 525).
+
+**What validation can and cannot tell.** 120 validation images is small: one image is 0.8 percentage points, so differences of a point or two between rows are noise. The rotated set imitates the test images but is not identical to them. I chose settings by looking at these numbers, so the final figures are slightly optimistic. The small CNN's remaining errors (species_01/03, 09/11) show where a weaker model still fails.
 
 ## References and code sources
 * Starter notebook `LeafID_starter.ipynb` (course material): section 1 is its code, copied unchanged. Its `accuracy` function and its recipe are reused in the two cells after it, and our `SmallCNN` is the starter's network with options to add batch normalisation and change the width.
