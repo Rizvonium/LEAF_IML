@@ -83,6 +83,7 @@ torch.backends.cudnn.deterministic = True
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
+T0 = time.time()                                      # to report the notebook's total run time at the end
 DATA = '/content/leaves'
 train_df = pd.read_csv(f'{DATA}/train_labels.csv')               # columns id, label
 sub_df = pd.read_csv(f'{DATA}/sample_submission.csv')            # required id order / format
@@ -507,6 +508,7 @@ check = pd.read_csv('predictions.csv')
 assert list(check.columns) == ['id', 'label'] and len(check) == 525 and check.id.tolist() == sub_df.id.tolist()
 print(check.shape); display(check.head())
 print('predicted test images per class:', check.label.value_counts().sort_index().to_dict())
+print(f'total run time of our code: {(time.time() - T0) / 60:.1f} min')
 """)
 
 # --------------------------------------------------------------------------
