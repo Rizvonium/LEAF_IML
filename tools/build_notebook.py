@@ -202,13 +202,17 @@ rng = np.random.RandomState(0)
 val_idx = np.sort(np.concatenate([rng.choice(np.where(y_all == k)[0], 8, replace=False) for k in range(15)]))
 tr_idx = np.setdiff1d(np.arange(len(y_all)), val_idx)
 
-BG = (X_all[:, :, 0, :].float().median(dim=0).values.median(dim=1).values / 255).tolist()   # background RGB in [0,1]
 X_all_d, X_te_d, y_all_d = X_all.to(DEV), X_te.to(DEV), y_all.to(DEV)
+BG = (X_all[:, :, 0, :].float() / 255).median(dim=0).values.median(dim=1).values.to(DEV).view(3, 1, 1)  # background RGB
+print('background colour (RGB, 0-1):', BG.flatten().cpu().numpy().round(3))
 
 def rotate_shift(x, angle, tx, ty, flip=False):
-    # x: 3 x H x W float image in [0,1]; rotate (degrees), shift (pixels), optionally mirror
-    x = TF.affine(x, angle=angle, translate=[tx, ty], scale=1.0, shear=[0.0, 0.0],
-                  interpolation=TF.InterpolationMode.BILINEAR, fill=BG)
+    # x: 3 x H x W float image in [0,1]; rotate (degrees), shift (pixels), optionally mirror.
+    # We rotate the difference from the background colour, so the corners uncovered by the rotation
+    # (filled with 0) become exactly background colour, with no dark seam at the old image edge.
+    x = TF.affine(x - BG, angle=angle, translate=[tx, ty], scale=1.0, shear=[0.0, 0.0],
+                  interpolation=TF.InterpolationMode.BILINEAR) + BG
+    x = x.clamp(0, 1)
     return TF.horizontal_flip(x) if flip else x
 
 def augment(xb):

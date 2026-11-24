@@ -97,7 +97,7 @@ For prediction: softmax probabilities, averaged over the 8 TTA views, then over 
 - **How did you find the rotation problem?** By looking at the test images and measuring each leaf's long-axis angle: training angles cluster near 0°, test angles are spread uniformly.
 - **Why rotate the validation set?** The test images are rotated. An upright validation set would tell me the model is good when it can fail on rotated leaves (compare the two bars in the log plot).
 - **Why 360° and not ±20°?** Test leaves are at every angle, including upside down (the histogram is flat).
-- **What fills the corners after rotation?** The median background colour of the training images (`BG`). Black corners would be an artificial cue that test images don't have.
+- **What fills the corners after rotation?** The median background colour of the training images (`BG`). `rotate_shift` rotates *(image − BG)*, so the uncovered corners come out as 0 and, after adding BG back, as exactly background colour. (Using torchvision's `fill=` option instead left a thin dark seam along the old image edge, a cue the test images don't have. I found it by looking at the rotated validation images.) Black corners would likewise be an artificial cue.
 - **Why batch size 32?** More updates per epoch (15 instead of 2), and the gradient noise helps generalisation. It is also big enough for stable batch-norm statistics.
 - **Why a cosine schedule / 80 epochs?** Augmented data never repeats exactly, so the model needs more passes; decaying the learning rate at the end lets it settle into a minimum.
 - **Why ResNet-18 and not something bigger?** It is small (11 M parameters), fast on a T4, and already **[from run]** accurate. The handout asks for understanding, not the largest model.
