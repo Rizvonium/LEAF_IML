@@ -1,0 +1,7 @@
+# data and generated files
+leaves.zip
+leaves_data/
+*.zip
+executed_*.ipynb
+__pycache__/
+.ipynb_checkpoints/
