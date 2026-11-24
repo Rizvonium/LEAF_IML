@@ -1,7 +1,5 @@
-# data and generated files
-leaves.zip
+# generated files (leaves.zip is deliberately NOT ignored so it can be committed)
 leaves_data/
-*.zip
 executed_*.ipynb
 __pycache__/
 .ipynb_checkpoints/
