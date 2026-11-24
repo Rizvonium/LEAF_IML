@@ -17,7 +17,7 @@ Numbers marked **[run]** must be copied from your Colab outputs. Numbers in *ita
    - ~92% of training leaves have their long axis within 30° of vertical, against ~33% of test leaves (uniform angles would give 1/3);
    - among near-vertical leaves, the stem points down in most training images but in only about half of the test images, so test leaves are upside down as often as not;
    - the distance of the leaf from the image centre is the same in train and test (median ~4.8 px), so there is no extra shift: test images are training-style scans rotated about their centre;
-   - size, colour and background are identical.
+   - size, colour, background and **sharpness** are identical (mean |Laplacian| on leaf pixels: 0.131 in both). So the test leaves were rotated without blurring them.
 
    Consequences: (a) train with 360° rotation augmentation; (b) upright validation accuracy can overestimate test accuracy, so I also score every experiment on a **rotated validation set**.
 4. **Experiment log (60 s).** One change per row, 3 seeds each, on the starter's own small CNN:
@@ -41,7 +41,7 @@ Numbers marked **[run]** must be copied from your Colab outputs. Numbers in *ita
 | 1. Starter unchanged | the starter's 6 code cells, untouched; a cell recording train/val accuracy; a cell repeating the starter's exact recipe with seeds 0, 1, 2 | `EPOCHS = 5`, `BATCH_SIZE = 256`, `LR = 0.05`, `IMG_SIZE = 64`, the `SGD` line |
 | 2. Data | loads every image once as a `uint8` tensor `N×3×128×128` (`load_folder`), prints counts/sizes, example grids, measures each leaf (`leaf_measurements`) | the leaf mask: pixels that differ from the image's flat background colour (top-left pixel) by > 40; the angle: main eigenvector of the covariance of leaf-pixel coordinates; stem direction: sign of the third moment along that axis |
 | 3. Diagnosis | hypotheses, each linked to a log row; prints updates per epoch, the starter's uneven validation class counts, the mean pixel value | |
-| 4. Shared code | stratified split (`val_idx`, 8 per species), `rotate_shift`, `augment`, `val_x` / `val_x_rot`, `SmallCNN`, `Wrapped`, `build_model`, `predict_proba`, `train_model`, `run_experiment`, `tta_row` | the training loop in `train_model`: forward → `F.cross_entropy` → `opt.zero_grad()` → `loss.backward()` → `opt.step()` |
+| 4. Shared code | stratified split (`val_idx`, 8 per species), `rotate_batch` (bicubic rotation, prints the sharpness comparison), `augment`, `val_x` / `val_x_rot`, `SmallCNN`, `Wrapped`, `build_model`, `predict_proba`, `train_model`, `run_experiment`, `tta_row` | the training loop in `train_model`: forward → `F.cross_entropy` → `opt.zero_grad()` → `loss.backward()` → `opt.step()` |
 | 5. Experiment log | rows E0–E11, one change per row | each `cfg = dict(cfg, key=value)` copies the previous config and changes one key |
 | 6. Pretrained | P1–P3, torchvision ResNet-18 | `net.fc = nn.Linear(net.fc.in_features, 15)` (in_features = 512 for ResNet-18) replaces the 1000-class ImageNet layer |
 | evidence | learning curves (3 seeds), accuracy vs rotation (E6 vs E7), shift test | |
@@ -109,7 +109,9 @@ Prediction: softmax probabilities, averaged over the 8 TTA views, then over the 
 - **How did you find the rotation problem?** By looking at the test images, then measuring each leaf's long-axis angle and stem direction: training angles cluster near 0° with stems down; test angles are spread evenly and stems point down only half the time.
 - **Why rotate the validation set?** The test images are rotated. Upright validation said the model was improving at E5/E6 while rotated validation stayed flat (compare the two bars in the log plot).
 - **Why 360° and not ±20°?** The axis-angle histogram is flat and the stem direction is 50/50 on test images, so test leaves point every way, including upside down.
-- **What fills the corners after rotation?** That image's own background colour (each image has one flat background colour; `bg = x[:, :1, :1]`). `rotate_shift` rotates *(image − bg)* with zero padding and adds bg back, so the corners come out exactly background-coloured. (Using torchvision's `fill=` option left a thin dark seam along the old image edge, a cue the test images don't have; I found it by looking at the rotated images.)
+- **Why bicubic interpolation for the rotation?** Rotating moves pixels to non-integer positions, so new pixel values must be interpolated. Bilinear interpolation averages the 4 nearest pixels and visibly blurs the leaf: sharpness 0.131 drops to 0.093. Bicubic uses 16 neighbours with a sharper kernel: 0.117, much closer to the test images' 0.131. I first used bilinear, then noticed that augmented models scored *higher* on rotated (blurred) validation images than on sharp upright ones, measured the sharpness and switched. The notebook prints the comparison in section 4.
+- **How does `rotate_batch` work?** For each image a 2×3 matrix `theta = [[cos, −sin, shift], [sin, cos, 0]]`. `F.affine_grid` turns it into, for every output pixel, the input position to read from, in [−1, 1] coordinates. `F.grid_sample` reads those positions (bicubic). Positions outside the image read 0; because we rotate *image − background* and add the background back, those corners become background-coloured.
+- **What fills the corners after rotation?** That image's own background colour (each image has one flat background colour; `bg = x[:, :, :1, :1]`). `rotate_batch` rotates *(image − bg)* with zero padding and adds bg back, so the corners come out exactly background-coloured. (An earlier version using torchvision's `fill=` option left a thin dark seam along the old image edge, a cue the test images don't have; I found it by looking at the rotated images.)
 - **Why batch size 32?** More updates per epoch (15 instead of 2), and the gradient noise helps generalisation. It's still large enough for stable batch-norm statistics.
 - **Why 80 epochs and a cosine schedule?** Augmented images never repeat exactly, so the model needs more passes; decaying the learning rate at the end lets it settle (E8, E9 **[run]**).
 - **Why ResNet-18 and not something bigger?** It is small (11 M parameters), quick on a T4, and already **[run]** accurate. The handout asks for understanding, not the largest model.
@@ -122,6 +124,6 @@ Prediction: softmax probabilities, averaged over the 8 TTA views, then over the 
 ### Small code changes you might be asked to make live
 - Change the number of epochs of a row: edit `epochs=` in that row's `cfg = dict(cfg, ...)`. Rows build on the row above, so the change carries into later rows until one sets that key again.
 - Turn off augmentation: `aug=False`.
-- Accuracy of one model at a specific rotation: `accuracy_of(RUNS['E7']['models'][0], torch.stack([rotate_shift(x, 90) for x in val_x]), val_y)`.
+- Accuracy of one model at a specific rotation: `accuracy_of(RUNS['E7']['models'][0], rotate_batch(val_x, torch.full((len(val_x),), 90.0, device=DEV)), val_y)`.
 - One test image with the final ensemble: `CLASSES[torch.stack([predict_proba(m, X_te_f[:1], tta=True) for m in final_models]).mean(0).argmax(1).item()]`.
 - One rotated validation image with a P3 model: `CLASSES[predict_proba(RUNS['P3']['models'][0], val_x_rot[:1], tta=True).argmax(1).item()]`.
