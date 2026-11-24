@@ -1,30 +1,19 @@
 # LeafID: tree species from scanned leaves (Assignment 2)
 
-CNN trained **from scratch** (no pretrained weights, no external data) on 600 labelled leaf scans
-(15 species × 40) to predict the species of 525 unlabelled test scans.
-
-## Files
 | file | what |
 |---|---|
-| `LeafIDMir.ipynb` | the submission notebook: baseline → diagnosis → one-change-at-a-time ablation → evidence → final ensemble → `predictions.csv` |
-| `tools/build_notebook.py` | generates the notebook from plain-Python cell sources (edit here, then rebuild) |
-| `tools/make_synthetic_leaves.py` | synthetic stand-in data, only for smoke-testing the pipeline before the real data is available |
+| `LeafID_Rizwan_Mir.ipynb` | **the submission notebook**: starter run unchanged → data examination → diagnosis → experiment log (small CNN, one change per row, 3 seeds) → ImageNet-pretrained ResNet-18 → final model, confusion matrix, misclassified images → `predictions.csv` |
+| `tools/build_notebook.py` | generates the notebook from plain-Python cell sources (edit there, then `python tools/build_notebook.py`) |
+| `starter/` | the course's starter notebook and handout (the starter's code cells are copied unchanged into section 1 of the notebook) |
 
 ## Run on Colab
 1. Runtime → Change runtime type → **T4 GPU**
 2. Upload `leaves.zip` to `/content` (Files panel)
-3. Runtime → **Run all**. Writes `predictions.csv`.
+3. Runtime → **Run all**. It writes `predictions.csv` (header `id,label`, 525 rows).
 
-## Rebuild / smoke-test locally
-```bash
-python tools/build_notebook.py
-python tools/make_synthetic_leaves.py /tmp/synth/leaves.zip
-LEAF_QUICK=1 LEAF_ZIP=/tmp/synth/leaves.zip LEAF_DIR=/tmp/synth/data jupyter nbconvert --to notebook --execute LeafIDMir.ipynb --output /tmp/synth/executed_quick.ipynb
-```
-
-## Method in one paragraph
-Every configuration is scored with the same stratified 5-fold cross-validation, so changes can be compared fold by fold.
-Starting from the starter's design, each ablation row adds a single change, in this order:
-input standardisation → crop-to-leaf + aspect-preserving pad → BatchNorm/residual/global-average-pool network →
-geometric augmentation → AdamW + one-cycle LR + label smoothing → higher resolution → test-time augmentation.
-Each change comes with a specific piece of evidence: learning curves, accuracy vs rotation angle, confusion matrix, Grad-CAM.
+## Key finding about the data
+Training leaves are scanned **upright and centred**; test leaves are **rotated to any angle and shifted**
+(about 9 in 10 training leaves are within 30° of vertical, against about 1 in 3 test leaves, which is what uniformly random angles give).
+A CNN is not rotation-invariant, so the model is trained with full-360° rotation, shift and mirror augmentation.
+Every experiment is also scored on a *rotated validation set* that mimics the test images, because plain
+(upright) validation accuracy overestimates test accuracy.

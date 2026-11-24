@@ -1,14 +1,17 @@
-"""Build LeafIDMir.ipynb from the cell sources below.
+"""Build LeafID_Rizwan_Mir.ipynb from the cell sources below.
 
-Run:  python tools/build_notebook.py            -> writes LeafIDMir.ipynb
-The notebook is the deliverable; this script only exists so the cells can be
+    python tools/build_notebook.py        # writes LeafID_Rizwan_Mir.ipynb
+
+The notebook is the deliverable. This script only exists so the cells can be
 edited as plain Python and the notebook regenerated.
 """
+import json
 import sys
 from pathlib import Path
 
 import nbformat as nbf
 
+ROOT = Path(__file__).resolve().parent.parent
 CELLS = []
 
 
@@ -22,790 +25,506 @@ def code(s):
 
 # ==========================================================================
 md(r"""
-# LeafID: identifying tree species from scanned leaves (CNN trained from scratch)
+# Leaf species recognition with CNNs (Assignment 2)
 
-**Task.** 600 labelled leaf scans from 15 species (40 per species) and 525 unlabelled test scans.
-The starter notebook trains a small CNN that performs poorly. This notebook
-1. runs the starter as given (baseline),
-2. diagnoses why it performs poorly,
-3. fixes and improves it **one change at a time**, scoring every change with the same 5-fold stratified cross-validation, paired fold-by-fold and against a measured seed-noise floor,
-4. backs each change with a specific piece of evidence, and
-5. trains the final ensemble and writes `predictions.csv`.
+**Goal.** Predict which of 15 tree species a scanned leaf comes from. We have 600 labelled training images (40 per species) and 525 unlabelled test images, all 128×128 RGB.
 
-No pretrained weights or external data: every network is trained from random initialisation on the 600 labelled images only.
+**Plan of this notebook**
+1. Run the starter notebook **unchanged** and record its results.
+2. Load the data; report class counts and image sizes; examine the training and test images. Key finding: **training leaves are upright and centred, test leaves are rotated to any angle and shifted.**
+3. Diagnose why the starter performs poorly.
+4. Shared code: validation split, a rotated (test-like) validation set, augmentation, models, training loop.
+5. Experiment log: fix the starter's small CNN **one change at a time**, with 3 random seeds per change.
+6. Fine-tune an ImageNet-pretrained ResNet-18 (allowed by the handout) with the same fixes.
+7. Final model: 3 seeds, mean ± spread; confusion matrix; misclassified examples; `predictions.csv` (header `id,label`, 525 rows).
+8. Summary and references.
 
-**To run:** Colab → Runtime → Change runtime type → **T4 GPU**; upload `leaves.zip` to `/content`; Runtime → **Run all**.
+**Runtime:** Colab → Runtime → Change runtime type → **T4 GPU**, upload `leaves.zip` to `/content`, then Runtime → **Run all** (well under 30 minutes).
 """)
 
-md("## 0. Setup")
+# --------------------------------------------------------------------------
+md(r"""
+## 1. The starter notebook, unchanged
+The next six cells are the starter notebook's code cells, copied without any change, so its results are recorded before anything is modified. (It writes a `predictions.csv`; that file is overwritten by the final model at the end.)
+""")
+STARTER = json.load(open(ROOT / "starter" / "LeafID_starter.ipynb"))
+for c in STARTER["cells"]:
+    if c["cell_type"] == "code":
+        code("".join(c["source"]))
+
 code(r"""
-import os
-os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')   # deterministic cuBLAS
-import time, math, random, zipfile, copy
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from PIL import Image, ImageOps
-from scipy import ndimage, stats
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import confusion_matrix, f1_score
-try:
-    display
-except NameError:            # outside Jupyter
-    display = print
+# Record the starter's numbers before changing anything
+starter_train_acc = accuracy(model, X_tr, y_tr)
+starter_val_acc = accuracy(model, X_val, y_val)
+print(f'Starter (unchanged): train accuracy {starter_train_acc:.3f}, validation accuracy {starter_val_acc:.3f}')
+print(f'Chance level for 15 balanced classes: {1/15:.3f}')
+print('Starter predictions per class on the test set:', pd.read_csv('predictions.csv').label.value_counts().to_dict())
+""")
 
-QUICK = os.environ.get('LEAF_QUICK') == '1'      # tiny smoke-test settings (local CPU testing only)
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('device:', DEVICE, '| torch', torch.__version__, '| QUICK =', QUICK)
-if DEVICE.type == 'cuda':
-    print(torch.cuda.get_device_name(0))
-elif not QUICK and os.environ.get('LEAF_ALLOW_CPU') != '1':
-    raise RuntimeError('No GPU. Runtime > Change runtime type > T4 GPU, then Run all.')
+# --------------------------------------------------------------------------
+md(r"""
+## 2. Data: counts, sizes, and what the images look like
+From here on, all code is ours. Images are loaded once at their full 128×128 resolution and kept as `uint8` tensors.
+""")
+code(r"""
+import os, time, math, random, copy
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+import torch, torch.nn as nn, torch.nn.functional as F
+import torchvision
+from torchvision.transforms.v2 import functional as TF
+from PIL import Image
 
-# reproducibility: same seed -> same weights, so paired comparisons between rows are not polluted by GPU noise
-torch.backends.cudnn.benchmark = False
+DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
+QUICK = os.environ.get('LEAF_QUICK') == '1'          # only for a fast local smoke test; False on Colab
+SEEDS = [0, 1, 2]                                    # every experiment is repeated with these 3 seeds
+torch.backends.cudnn.benchmark = False               # reproducible convolution algorithms
 torch.backends.cudnn.deterministic = True
-def seed_everything(seed):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-T0 = time.time()
+
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+DATA = '/content/leaves'
+train_df = pd.read_csv(f'{DATA}/train_labels.csv')               # columns id, label
+sub_df = pd.read_csv(f'{DATA}/sample_submission.csv')            # required id order / format
+CLASSES = sorted(train_df.label.unique())
+y_all = torch.tensor([CLASSES.index(c) for c in train_df.label])
+
+def load_folder(folder, ids):
+    return torch.from_numpy(np.stack([np.asarray(Image.open(f'{DATA}/{folder}/{i}.png').convert('RGB')) for i in ids])
+                            ).permute(0, 3, 1, 2).contiguous()     # N x 3 x 128 x 128, uint8
+
+X_all = load_folder('train', train_df.id)
+X_te = load_folder('test', sub_df.id)
+print('train:', tuple(X_all.shape), ' test:', tuple(X_te.shape), ' dtype:', X_all.dtype)
+print('image sizes (train, test):', {tuple(X_all.shape[2:])}, {tuple(X_te.shape[2:])})
+print('images per class:'); print(train_df.label.value_counts().sort_index().to_string())
+""")
+code(r"""
+fig, axes = plt.subplots(15, 6, figsize=(9, 22))
+for r, c in enumerate(CLASSES):
+    idx = np.where(train_df.label == c)[0][:6]
+    for k, i in enumerate(idx):
+        axes[r, k].imshow(X_all[i].permute(1, 2, 0)); axes[r, k].axis('off')
+    axes[r, 0].set_title(c, fontsize=8, loc='left')
+plt.suptitle('Training images: 6 per species', y=1.0); plt.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(3, 10, figsize=(15, 4.8))
+for k, ax in enumerate(axes.flat):
+    ax.imshow(X_te[k].permute(1, 2, 0)); ax.set_title(sub_df.id[k], fontsize=7); ax.axis('off')
+plt.suptitle('Test images (first 30)'); plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+### Measuring the difference between training and test images
+For each image we separate the leaf from the background by thresholding against the background colour (median of the border pixels). From the leaf pixels we measure:
+* **orientation:** the angle of the leaf's long axis (the main eigenvector of the pixel-coordinate covariance), with 0° meaning vertical;
+* **position:** the centre of the leaf pixels;
+* **size and colour:** the fraction of the image covered by the leaf, and the mean leaf colour.
+""")
+code(r"""
+def leaf_measurements(img):
+    a = img.permute(1, 2, 0).numpy().astype(np.int16)                 # H x W x 3
+    border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])
+    bg = np.median(border, axis=0)
+    mask = np.abs(a - bg).max(axis=2) > 40                            # leaf pixels
+    ys, xs = np.nonzero(mask)
+    cov = np.cov(np.stack([xs - xs.mean(), ys - ys.mean()]))
+    vx, vy = np.linalg.eigh(cov)[1][:, -1]                            # long-axis direction
+    angle = (np.degrees(np.arctan2(vx, vy)) + 90) % 180 - 90          # 0 = vertical
+    return dict(angle=angle, cx=xs.mean(), cy=ys.mean(), area=mask.mean(),
+                green=a[mask][:, 1].mean(), bg=bg.mean())
+
+meas = pd.DataFrame([leaf_measurements(x) for x in X_all] + [leaf_measurements(x) for x in X_te])
+meas['split'] = ['train'] * len(X_all) + ['test'] * len(X_te)
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+for s, col in [('train', 'C0'), ('test', 'C1')]:
+    m = meas[meas.split == s]
+    axes[0].hist(m.angle, bins=36, range=(-90, 90), alpha=.6, label=s, color=col)
+    axes[1].scatter(m.cx, m.cy, s=6, alpha=.5, label=s, color=col)
+    axes[2].hist(m.area, bins=30, alpha=.6, label=s, color=col)
+axes[0].set_xlabel('leaf long-axis angle from vertical (deg)'); axes[0].set_title('Orientation'); axes[0].legend()
+axes[1].set_xlabel('leaf centre x (px)'); axes[1].set_ylabel('leaf centre y (px)'); axes[1].set_title('Position'); axes[1].legend()
+axes[1].set_xlim(30, 98); axes[1].set_ylim(98, 30)
+axes[2].set_xlabel('fraction of image covered by the leaf'); axes[2].set_title('Size'); axes[2].legend()
+plt.tight_layout(); plt.show()
+
+summary = meas.groupby('split').agg(near_vertical=('angle', lambda a: (a.abs() < 30).mean()),
+                                    centre_x_sd=('cx', 'std'), centre_y_sd=('cy', 'std'),
+                                    leaf_area=('area', 'mean'), leaf_green=('green', 'mean'), background=('bg', 'mean'))
+display(summary.round(3))
+""")
+
+md(r"""
+**Findings**
+* The classes are balanced (40 each) and every image is 128×128 RGB on a near-white background.
+* **Training leaves are upright** (stem down, long axis within 30° of vertical for about 9 in 10 images) **and horizontally centred**. **Test leaves are rotated to any angle**, upside down included (only about 1 in 3 is near-vertical, which is what uniformly random angles give), **and shifted off centre**.
+* Leaf size, leaf colour and background brightness are the same in both sets, so the shift is purely geometric.
+
+**Consequences for the modelling**
+1. A CNN is not rotation-invariant. Its filters respond to patterns in a particular orientation, so a model that only ever sees upright leaves has no reason to recognise a sideways one. We must **train with random rotations (full 360°) and shifts**.
+2. A validation set cut from the training images is upright, so its accuracy **overestimates** test accuracy. Alongside the normal validation accuracy, every experiment therefore reports accuracy on a **rotated validation set**: the same validation images, each rotated by a random angle and shifted by a few pixels with a fixed seed, to mimic the test images. This is our best estimate of test accuracy.
 """)
 
 # --------------------------------------------------------------------------
 md(r"""
-## 1. Load the data
-Upload `leaves.zip` to `/content` (Files panel) before running.
+## 3. Why the starter performs poorly
+Each point below is backed by a number or a plot from this notebook.
+1. **Far too few gradient updates.** 480 training images with batch size 256 is 2 updates per epoch, so 5 epochs give **10 SGD updates** in total, with plain SGD (no momentum). The network has barely moved from its random initialisation: training accuracy is as low as validation accuracy. That is under-fitting, not over-fitting. *Training long enough is the first change that makes it learn* (E1 in the log).
+2. **Plain SGD at a fixed learning rate** makes slow progress even with enough steps. Adam adapts the step size per parameter (E2).
+3. **Images are shrunk from 128 to 64 pixels**, which throws away fine detail such as leaf-margin teeth and veins (E3).
+4. **Inputs are not standardised and there is no batch normalisation**, so the activation scale drifts from layer to layer and optimisation is harder (E4, E5).
+5. **Train/test mismatch:** the model only ever sees upright, centred leaves, but the test leaves are rotated and shifted (section 2). This is the biggest problem once the model learns (E6).
+6. **Validation is not representative and not repeated:** a random (unstratified) 20% split of upright images, with one seed. We use a stratified split (8 per species), add the rotated validation set, and repeat each experiment with 3 seeds.
 """)
 code(r"""
-DATA_DIR = Path(os.environ.get('LEAF_DIR', '/content/leaves_data'))
-ZIP_PATH = Path(os.environ.get('LEAF_ZIP', '/content/leaves.zip'))
-if not DATA_DIR.exists():
-    if not ZIP_PATH.exists():
-        zips = sorted(Path('/content').glob('*.zip')) if Path('/content').exists() else []
-        if zips:
-            ZIP_PATH = zips[0]
-        else:
-            from google.colab import files
-            uploaded = files.upload()
-            if not uploaded:
-                raise FileNotFoundError('no zip uploaded')
-            ZIP_PATH = Path(next(iter(uploaded))).resolve(); del uploaded
-    print('extracting', ZIP_PATH)
-    with zipfile.ZipFile(ZIP_PATH) as z:
-        z.extractall(DATA_DIR)
-
-IMG_EXT = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
-all_imgs = sorted(p for p in DATA_DIR.rglob('*')
-                  if p.suffix.lower() in IMG_EXT and '__MACOSX' not in p.parts and not p.name.startswith('.'))
-is_test = lambda p: any(part.lower().startswith('test') for part in p.relative_to(DATA_DIR).parts[:-1])
-train_paths = [p for p in all_imgs if not is_test(p)]
-test_paths = [p for p in all_imgs if is_test(p)]
-
-# Labels: from a CSV whose rows name the training images, if there is one; otherwise from the parent folder.
-# A CSV that names the *test* images is treated as the submission template (its columns and row order are kept).
-def _stem_set(paths):
-    return {p.stem for p in paths} | {p.name for p in paths}
-label_map, SUB_TEMPLATE = None, None
-for c in sorted(p for p in DATA_DIR.rglob('*.csv') if '__MACOSX' not in p.parts):
-    df = pd.read_csv(c)
-    for col in df.columns:
-        vals = df[col].astype(str)
-        if len(train_paths) and vals.isin(_stem_set(train_paths)).mean() > 0.9:
-            other = [k for k in df.columns if k != col and df[k].nunique() <= 100]
-            if other:
-                label_map = {str(k): str(v) for k, v in zip(vals, df[other[0]])}
-                print(f'labels from {c.name}: {col} -> {other[0]}')
-        if len(test_paths) and vals.isin(_stem_set(test_paths)).mean() > 0.9:
-            SUB_TEMPLATE = (df, col); print(f'submission template: {c.name} (id column {col!r}, columns {list(df.columns)})')
-if label_map:
-    train_labels_str = [label_map.get(p.name, label_map.get(p.stem)) for p in train_paths]
-else:
-    train_labels_str = [p.parent.name for p in train_paths]
-
-CLASSES = sorted(set(train_labels_str))
-CLS2IDX = {c: i for i, c in enumerate(CLASSES)}
-y_all = np.array([CLS2IDX[s] for s in train_labels_str])
-N_CLASSES = len(CLASSES)
-print(f'{len(train_paths)} labelled images, {len(test_paths)} test images, {N_CLASSES} classes')
-print(pd.Series(train_labels_str).value_counts().sort_index().to_string())
-assert N_CLASSES == 15, f'expected 15 species, found {N_CLASSES}: check the folder/CSV layout'
-assert len({p.name for p in test_paths}) == len(test_paths), 'test file names are not unique'
-if (len(train_paths), len(test_paths)) != (600, 525):
-    print('WARNING: expected 600 train / 525 test images')
-""")
-
-md("### 1.1 What do the images look like?")
-code(r"""
-info = []
-for p in train_paths + test_paths:
-    with Image.open(p) as im:
-        info.append((im.size[0], im.size[1], im.mode, str(im.info.get('dpi', ''))))
-meta = pd.DataFrame(info, columns=['w', 'h', 'mode', 'dpi'])
-meta['split'] = ['train'] * len(train_paths) + ['test'] * len(test_paths)
-print(meta.groupby('split')[['w', 'h']].describe().T.round(0))
-print('modes:', meta['mode'].value_counts().to_dict(), '| dpi:', meta['dpi'].value_counts().head(3).to_dict())
-
-fig, axes = plt.subplots(3, 5, figsize=(15, 9))
-for ax, c in zip(axes.flat, CLASSES):
-    p = train_paths[int(np.where(y_all == CLS2IDX[c])[0][0])]
-    ax.imshow(Image.open(p).convert('RGB')); ax.set_title(c, fontsize=9); ax.axis('off')
-plt.suptitle('One labelled example per species'); plt.tight_layout(); plt.show()
-
-fig, axes = plt.subplots(2, 8, figsize=(16, 4.5))
-for ax, p in zip(axes.flat, test_paths[:16]):
-    ax.imshow(Image.open(p).convert('RGB')); ax.set_title(p.name, fontsize=7); ax.axis('off')
-plt.suptitle('Unlabelled test images'); plt.tight_layout(); plt.show()
-""")
-
-# --------------------------------------------------------------------------
-md(r"""
-## 2. The starter notebook, run as given (baseline)
-
-*(Starter code goes here unchanged, with its outputs.)*
-""")
-code(r"""
-# STARTER CODE PLACEHOLDER: replaced with the provided starter cells once available.
-""")
-
-md(r"""
-## 3. Diagnosis: why the starter performs poorly
-
-*(Filled in after reading and running the starter.)*
-""")
-
-# --------------------------------------------------------------------------
-md(r"""
-## 4. Improved pipeline
-
-### 4.1 Preprocessing
-Every scan is decoded **once** at full resolution and turned into two square versions at `BASE_RES`:
-* **no-crop**: the whole scan padded to a square with its own background colour, so the aspect ratio is kept (squashing to a square would distort leaf shape differently for each scan);
-* **crop**: the leaf is found by thresholding against the background colour (small specks removed) and cut out of the *full-resolution* scan. It is centred in a square whose side is the diameter of the leaf's enclosing circle plus a margin, so rotating it never pushes the tip or stem out of the frame.
-
-Measurements of each leaf (the angle of its long axis, and its length in original pixels) are also stored; 4.2 uses them to check orientation and size.
-""")
-code(r"""
-BASE_RES = 96 if QUICK else 384
-THR, MARGIN = 40, 0.06
-
-def border_bg(a):
-    b = np.concatenate([a[:3].reshape(-1, 3), a[-3:].reshape(-1, 3), a[:, :3].reshape(-1, 3), a[:, -3:].reshape(-1, 3)])
-    return np.median(b, axis=0)
-
-def leaf_mask(a, bg):
-    m = np.abs(a.astype(np.int16) - bg.astype(np.int16)[None, None]).max(axis=2) > THR
-    lab, n = ndimage.label(m)
-    if n == 0:
-        return m
-    sizes = ndimage.sum(m, lab, range(1, n + 1))
-    keep = np.isin(lab, 1 + np.nonzero(sizes >= 0.02 * sizes.max())[0])   # drop dust / specks
-    return keep
-
-def to_square(arr, cy, cx, s, bg, res):
-    # place arr into an s x s canvas (filled with bg) so that (cy, cx) lands at the centre; resize to res
-    canvas = np.empty((s, s, 3), np.uint8); canvas[:] = bg.astype(np.uint8)
-    oy, ox = int(round(cy - s / 2)), int(round(cx - s / 2))
-    H, W = arr.shape[:2]
-    sy0, sx0, sy1, sx1 = max(0, oy), max(0, ox), min(H, oy + s), min(W, ox + s)
-    canvas[sy0 - oy:sy1 - oy, sx0 - ox:sx1 - ox] = arr[sy0:sy1, sx0:sx1]
-    im = Image.fromarray(canvas)
-    while im.width > 4 * res:
-        im = im.reduce(2)
-    return np.asarray(im.resize((res, res), Image.LANCZOS))
-
-def decode(path):
-    img = Image.open(path); img.draft('RGB', (2 * BASE_RES * 4, 2 * BASE_RES * 4))
-    img = ImageOps.exif_transpose(img).convert('RGB')
-    full = np.asarray(img); H, W = full.shape[:2]
-    small = img.copy(); small.thumbnail((512, 512), Image.BILINEAR); f = W / small.width
-    a = np.asarray(small); bg = border_bg(a); m = leaf_mask(a, bg)
-    ys, xs = np.nonzero(m)
-    nocrop = to_square(full, H / 2, W / 2, max(H, W), bg, BASE_RES)
-    if len(ys) < 50:                                   # leaf not found: fall back to the whole scan
-        return nocrop, nocrop, bg / 255, (np.nan, np.nan, np.nan)
-    cy, cx = (ys.min() + ys.max()) / 2, (xs.min() + xs.max()) / 2
-    r = np.sqrt((ys - cy) ** 2 + (xs - cx) ** 2).max()
-    s = int(math.ceil(2 * r * (1 + 2 * MARGIN) * f)) + 2
-    crop = to_square(full, cy * f, cx * f, s, bg, BASE_RES)
-    # shape measurements (on the thumbnail mask, lengths converted to original pixels)
-    pts = np.stack([xs - xs.mean(), ys - ys.mean()], 1).astype(np.float64)
-    evals, evecs = np.linalg.eigh(np.cov(pts.T)); v = evecs[:, -1]
-    angle = math.degrees(math.atan2(v[0], v[1]))         # 0 = long axis vertical
-    angle = (angle + 90) % 180 - 90
-    proj = pts @ v
-    length = (proj.max() - proj.min()) * f
-    return nocrop, crop, bg / 255, (angle, length, m.mean())
-
-t = time.time()
-with ThreadPoolExecutor(8) as ex:
-    dec = list(ex.map(decode, train_paths + test_paths))
-NOCROP = torch.from_numpy(np.stack([d[0] for d in dec])).permute(0, 3, 1, 2).contiguous()
-CROP = torch.from_numpy(np.stack([d[1] for d in dec])).permute(0, 3, 1, 2).contiguous()
-BG = torch.tensor(np.stack([d[2] for d in dec]), dtype=torch.float32)
-LEAF = pd.DataFrame([d[3] for d in dec], columns=['angle', 'length_px', 'area_frac'])
-LEAF['split'] = meta['split'].values
-del dec
-NTR = len(train_paths)
-print(f'decoded {len(LEAF)} images in {time.time() - t:.0f}s; leaf not found in {LEAF.length_px.isna().sum()} images')
-
-fig, axes = plt.subplots(2, 8, figsize=(16, 4.5))
-for i in range(8):
-    j = i * (NTR // 8)
-    axes[0, i].imshow(NOCROP[j].permute(1, 2, 0)); axes[0, i].set_title('no-crop ' + CLASSES[y_all[j]], fontsize=7)
-    axes[1, i].imshow(CROP[j].permute(1, 2, 0)); axes[1, i].set_title('crop', fontsize=7)
-for ax in axes.flat: ax.axis('off')
+print('updates per epoch in the starter:', math.ceil(len(X_tr) / 256), '-> total updates:', math.ceil(len(X_tr) / 256) * 5)
+print('validation images per class in the starter split:', np.bincount(y_val.numpy(), minlength=15).tolist())
+fig, axes = plt.subplots(1, 2, figsize=(5, 2.6))
+axes[0].imshow(X_all[3].permute(1, 2, 0)); axes[0].set_title('128 px (original)', fontsize=8)
+axes[1].imshow(F.interpolate(X_all[3:4].float(), size=64, mode='bilinear', antialias=True)[0].permute(1, 2, 0).byte()); axes[1].set_title('64 px (starter)', fontsize=8)
+for a in axes: a.axis('off')
 plt.tight_layout(); plt.show()
 """)
 
+# --------------------------------------------------------------------------
 md(r"""
-### 4.2 Are the scans upright, and does leaf size carry information?
-Two facts about the data drive later choices:
-* **Orientation.** If train *and* test leaves all lie with the long axis near-vertical, orientation is consistent, and full 360° rotation augmentation would throw away a free cue (which end is the tip and which is the stem). The rotation range is then chosen by cross-validation (section 5.2).
-* **Size.** Cropping to the leaf and resizing makes every leaf the same size in pixels. If the scans share one resolution (DPI), the leaf's true length is a cheap species cue that the crop removes. Section 5.2 tests feeding it back in as an extra input.
+## 4. Shared code for all experiments
+* **Split:** stratified, 32 training and 8 validation images per species (480 / 120), fixed for every experiment so that the rows of the log are comparable.
+* **Rotated validation set:** each validation image is rotated by a random angle in [−180°, 180°] and shifted by up to 10 px (fixed seed). The empty corners are filled with the background colour.
+* **Augmentation** (training only, a fresh random draw for every image in every epoch): rotation by any angle, a shift of up to 10 px, and a left-right mirror half of the time. None of these change the species.
+* **Test-time augmentation (TTA):** average the predicted probabilities over the 8 rotations/mirrors that map a square image exactly onto itself (0°, 90°, 180°, 270°, each with and without a mirror).
+* **`run_experiment`** trains one configuration with each of the 3 seeds and records the mean and standard deviation of both validation accuracies.
 """)
 code(r"""
-fig, axes = plt.subplots(1, 3, figsize=(17, 4))
-for sp, col in [('train', 'C0'), ('test', 'C1')]:
-    axes[0].hist(LEAF.loc[LEAF.split == sp, 'angle'], bins=36, range=(-90, 90), alpha=.6, density=True, label=sp, color=col)
-axes[0].set_xlabel('angle of leaf long axis from vertical (deg)'); axes[0].legend(); axes[0].set_title('Orientation, train vs test')
-tr_len = LEAF.length_px.values[:NTR]
-order = np.argsort([np.nanmedian(tr_len[y_all == k]) for k in range(N_CLASSES)])
-axes[1].boxplot([tr_len[y_all == k][~np.isnan(tr_len[y_all == k])] for k in order], showfliers=False)
-axes[1].set_xticks(range(1, N_CLASSES + 1)); axes[1].set_xticklabels([CLASSES[k] for k in order], rotation=90, fontsize=7)
-axes[1].set_ylabel('leaf length (original px)'); axes[1].set_title('Leaf length per species (train)')
-for sp, col in [('train', 'C0'), ('test', 'C1')]:
-    axes[2].hist(LEAF.loc[LEAF.split == sp, 'length_px'].dropna(), bins=30, alpha=.6, density=True, label=sp, color=col)
-axes[2].set_xlabel('leaf length (original px)'); axes[2].legend(); axes[2].set_title('Leaf length, train vs test')
+# ---- fixed stratified split: 8 validation images per species ----
+rng = np.random.RandomState(0)
+val_idx = np.sort(np.concatenate([rng.choice(np.where(y_all == k)[0], 8, replace=False) for k in range(15)]))
+tr_idx = np.setdiff1d(np.arange(len(y_all)), val_idx)
+
+BG = (X_all[:, :, 0, :].float().median(dim=0).values.median(dim=1).values / 255).tolist()   # background RGB in [0,1]
+X_all_d, X_te_d, y_all_d = X_all.to(DEV), X_te.to(DEV), y_all.to(DEV)
+
+def rotate_shift(x, angle, tx, ty, flip=False):
+    # x: 3 x H x W float image in [0,1]; rotate (degrees), shift (pixels), optionally mirror
+    x = TF.affine(x, angle=angle, translate=[tx, ty], scale=1.0, shear=[0.0, 0.0],
+                  interpolation=TF.InterpolationMode.BILINEAR, fill=BG)
+    return TF.horizontal_flip(x) if flip else x
+
+def augment(xb):
+    # a fresh random rotation / shift / mirror for every image in the batch
+    return torch.stack([rotate_shift(x, random.uniform(-180, 180), random.randint(-10, 10), random.randint(-10, 10),
+                                     random.random() < 0.5) for x in xb])
+
+# ---- the rotated (test-like) validation set, made once with a fixed seed ----
+random.seed(123)
+val_x_rot = torch.stack([rotate_shift(x, random.uniform(-180, 180), random.randint(-10, 10), random.randint(-10, 10))
+                         for x in X_all_d[val_idx].float() / 255])
+val_y = y_all_d[val_idx]
+val_x = X_all_d[val_idx].float() / 255                 # upright validation images
+
+fig, axes = plt.subplots(2, 8, figsize=(14, 3.8))
+for k in range(8):
+    axes[0, k].imshow(X_all[val_idx[k * 15]].permute(1, 2, 0)); axes[0, k].axis('off')
+    axes[1, k].imshow(val_x_rot[k * 15].cpu().permute(1, 2, 0)); axes[1, k].axis('off')
+axes[0, 0].set_title('validation', fontsize=8, loc='left'); axes[1, 0].set_title('rotated validation (test-like)', fontsize=8, loc='left')
 plt.tight_layout(); plt.show()
-near_vertical = (LEAF.angle.abs() < 30).groupby(LEAF.split).mean()
-print('fraction of leaves within 30 deg of vertical:', near_vertical.round(3).to_dict())
-h = stats.kruskal(*[tr_len[y_all == k][~np.isnan(tr_len[y_all == k])] for k in range(N_CLASSES)])
-print(f'leaf length differs between species: Kruskal-Wallis H={h.statistic:.0f}, p={h.pvalue:.1e}')
-""")
-
-md(r"""
-### 4.3 Augmentation (on the GPU)
-Changes that should not alter the species label: left-right mirroring, a small rotation (or any rotation, if scans are not upright), slight zoom and shift, and brightness/contrast changes (scanner variation). Each batch gets a random affine warp; the area exposed by the warp is filled with that image's own background colour, so the model never sees black corners. The crop square is large enough that no rotation or zoom here cuts off the leaf. Up-down flips are *not* used: they swap the tip and the stem.
 """)
 code(r"""
-def gpu_augment(x, bg, a):
-    # x: (B,3,H,W) float in [0,1]; bg: (B,3) in [0,1]
-    B, dev = x.size(0), x.device
-    ang = (torch.rand(B, device=dev) * 2 - 1) * math.radians(a['rot_deg'])
-    sc = torch.empty(B, device=dev).uniform_(*a['scale'])          # sc > 1 zooms in
-    fl = torch.where(torch.rand(B, device=dev) < 0.5, -1.0, 1.0) if a['flip'] else torch.ones(B, device=dev)
-    tx, ty = (torch.rand(2, B, device=dev) * 2 - 1) * a['translate']
-    cos, sin = torch.cos(ang) / sc, torch.sin(ang) / sc
-    theta = torch.stack([torch.stack([cos * fl, -sin, tx], 1), torch.stack([sin * fl, cos, ty], 1)], 1)
-    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
-    bgv = bg.view(B, 3, 1, 1)
-    x = F.grid_sample(x - bgv, grid, mode='bilinear', padding_mode='zeros', align_corners=False) + bgv
-    if a['jitter'] > 0:
-        b = 1 + (torch.rand(B, 1, 1, 1, device=dev) * 2 - 1) * a['jitter']
-        c = 1 + (torch.rand(B, 1, 1, 1, device=dev) * 2 - 1) * a['jitter']
-        m = x.mean(dim=(1, 2, 3), keepdim=True)
-        x = ((x - m) * c + m) * b
-    return x.clamp(0, 1)
-
-def make_aug(rot_deg):
-    return dict(rot_deg=rot_deg, scale=(0.85, 1.05), flip=True, translate=0.04, jitter=0.15)
-AUG = make_aug(20)
-
-def tta_views(x, aug):
-    # test-time views that match what the model was trained to be invariant to
-    if aug is None:
-        return [x]
-    views = [x, x.flip(3)] if aug['flip'] else [x]
-    if aug['rot_deg'] >= 90:
-        views = [torch.rot90(v, k, dims=(2, 3)) for v in views for k in range(4)]
-    return views
-
-_x = CROP[:8].float().div(255); _bg = BG[:8]
-_xa = gpu_augment(_x.repeat(2, 1, 1, 1), _bg.repeat(2, 1), AUG)
-fig, axes = plt.subplots(2, 8, figsize=(16, 4.5))
-for i, ax in enumerate(axes.flat):
-    ax.imshow(_xa[i].permute(1, 2, 0)); ax.axis('off')
-plt.suptitle('Random augmentations of 8 training images (two draws each)'); plt.tight_layout(); plt.show()
-""")
-
-md(r"""
-### 4.4 Models
-* `plain`: conv → ReLU → max-pool blocks, flattened into a large fully connected layer, no normalisation (the starter's design style).
-* `leafnet`: a small residual CNN trained from scratch: BatchNorm after every convolution, residual blocks, global average pooling instead of the large flatten → dense layer, dropout before the classifier. It can optionally take the leaf's length as one extra input next to the pooled image features.
-""")
-code(r"""
-class PlainCNN(nn.Module):
-    def __init__(self, n_classes, res, widths=(16, 32, 64), hidden=128):
+class SmallCNN(nn.Module):
+    # The starter's network. bn=True adds batch normalisation after each convolution.
+    def __init__(self, n_classes=15, width=16, bn=False):
         super().__init__()
-        layers, c = [], 3
-        for w in widths:
-            layers += [nn.Conv2d(c, w, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2)]
-            c = w
+        layers, c_in = [], 3
+        for c_out in (width, 2 * width, 4 * width):
+            layers += [nn.Conv2d(c_in, c_out, 3, padding=1)]
+            if bn:
+                layers += [nn.BatchNorm2d(c_out)]
+            layers += [nn.ReLU(), nn.MaxPool2d(2)]
+            c_in = c_out
         self.features = nn.Sequential(*layers)
-        s = res // 2 ** len(widths)
-        self.head = nn.Sequential(nn.Flatten(), nn.Linear(c * s * s, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, n_classes))
-    def forward(self, x, size=None):
-        return self.head(self.features(x))
+        self.head = nn.Linear(4 * width, n_classes)
 
-def conv_bn(cin, cout, stride=1):
-    return nn.Sequential(nn.Conv2d(cin, cout, 3, stride, 1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
-
-class ResBlock(nn.Module):
-    def __init__(self, cin, cout, stride):
-        super().__init__()
-        self.c1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False); self.b1 = nn.BatchNorm2d(cout)
-        self.c2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False); self.b2 = nn.BatchNorm2d(cout)
-        self.short = (nn.Identity() if stride == 1 and cin == cout else
-                      nn.Sequential(nn.Conv2d(cin, cout, 1, stride, bias=False), nn.BatchNorm2d(cout)))
     def forward(self, x):
-        out = F.relu(self.b1(self.c1(x)))
-        return F.relu(self.b2(self.c2(out)) + self.short(x))
+        return self.head(F.adaptive_avg_pool2d(self.features(x), 1).flatten(1))
 
-class LeafNet(nn.Module):
-    def __init__(self, n_classes, widths=(32, 64, 128, 256), dropout=0.3, use_size=False):
+class Wrapped(nn.Module):
+    # resize to the network's input size and standardise, so every model takes 128x128 images in [0,1]
+    def __init__(self, net, size, mean, std):
         super().__init__()
-        self.stem = nn.Sequential(conv_bn(3, widths[0], 2), conv_bn(widths[0], widths[0]), nn.MaxPool2d(2))
-        blocks, c = [], widths[0]
-        for i, w in enumerate(widths):
-            blocks.append(ResBlock(c, w, 1 if i == 0 else 2)); c = w
-        self.blocks = nn.Sequential(*blocks)
-        self.use_size = use_size
-        self.drop = nn.Dropout(dropout)
-        self.fc = nn.Linear(c + int(use_size), n_classes)
-    def forward(self, x, size=None):
-        f = self.blocks(self.stem(x)).mean(dim=(2, 3))            # global average pooling
-        if self.use_size:
-            f = torch.cat([f, size.view(-1, 1).to(f.dtype)], 1)
-        return self.fc(self.drop(f))
+        self.net, self.size = net, size
+        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
+
+    def forward(self, x):
+        if self.size != x.shape[-1]:
+            x = F.interpolate(x, size=self.size, mode='bilinear', antialias=True, align_corners=False)
+        return self.net((x - self.mean) / self.std)
+
+DATA_MEAN = (X_all[tr_idx].float() / 255).mean(dim=(0, 2, 3)).tolist()     # from training images only
+DATA_STD = (X_all[tr_idx].float() / 255).std(dim=(0, 2, 3)).tolist()
+IMAGENET_MEAN, IMAGENET_STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
 def build_model(cfg):
-    if cfg['arch'] == 'plain':
-        return PlainCNN(N_CLASSES, cfg['res'])
-    return LeafNet(N_CLASSES, dropout=cfg['dropout'], use_size=cfg['use_size'])
-
-n_params = lambda m: sum(p.numel() for p in m.parameters())
-print('plain   params:', f"{n_params(PlainCNN(N_CLASSES, 64)):,}", '(at 64px)')
-print('leafnet params:', f"{n_params(LeafNet(N_CLASSES)):,}")
-""")
-
-md(r"""
-### 4.5 Training and evaluation
-* **5-fold stratified cross-validation, same folds for every configuration.** With 40 images per species, one 80/20 split leaves 8 validation images per species, so a single split can swing by several points by chance. Five folds validate on all 600 images once.
-* **Paired comparison.** Rows are compared fold by fold (mean difference with a 95% t-interval over the 5 folds), and by an exact McNemar test on the 600 out-of-fold predictions (does the new row fix more images than it breaks?). Section 5.2 also re-runs the final configuration with **fresh seeds**: the gap between two runs of the same configuration is the noise floor, and a gain smaller than that is not evidence.
-* **Honest numbers.** Each model is scored **after its last epoch**, never at its best validation epoch. Normalisation statistics (and the leaf-size scaling) come from the training fold only.
-* **Learning curves** score a fixed subset of training images exactly like validation images (eval mode, no augmentation, plain cross-entropy), so the train-vs-val gap measures memorisation rather than measurement differences.
+    if cfg['model'] == 'resnet18':
+        net = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+        net.fc = nn.Linear(net.fc.in_features, 15)                          # new 15-way classifier
+        return Wrapped(net, cfg['size'], IMAGENET_MEAN, IMAGENET_STD)
+    net = SmallCNN(width=cfg['width'], bn=cfg['bn'])
+    mean, std = (DATA_MEAN, DATA_STD) if cfg['normalize'] else ([0, 0, 0], [1, 1, 1])
+    return Wrapped(net, cfg['size'], mean, std)
 """)
 code(r"""
-BASE = dict(arch='leafnet', res=192, crop=True, epochs=120, bs=32, opt='adamw', lr=2e-3, wd=0.05,
-            sched='onecycle', label_smoothing=0.1, aug=AUG, normalize=True, dropout=0.3, use_size=False)
-N_FOLDS = 2 if QUICK else 5
-FOLDS = list(StratifiedKFold(N_FOLDS, shuffle=True, random_state=42).split(np.zeros(len(y_all)), y_all))
-
-def quick(cfg):
-    return dict(cfg, res=min(cfg['res'], 48), epochs=2) if QUICK else cfg
-
-_res_cache = {}
-def data_at(cfg):
-    # (X uint8 (N,3,r,r), bg (N,3), log-length (N,)) for all train+test images at this resolution / crop setting
-    key = (cfg['crop'], cfg['res'])
-    if key not in _res_cache:
-        X = CROP if cfg['crop'] else NOCROP
-        if X.shape[-1] != cfg['res']:
-            X = torch.cat([F.interpolate(X[i:i + 64].float(), size=(cfg['res'],) * 2, mode='bilinear',
-                                         antialias=True, align_corners=False).round().clamp(0, 255).to(torch.uint8)
-                           for i in range(0, len(X), 64)])
-        L = torch.tensor(np.log(LEAF.length_px.fillna(LEAF.length_px.median()).values), dtype=torch.float32)
-        _res_cache[key] = (X, BG, L)
-    return _res_cache[key]
-
-class Stats:
-    # per-model statistics, computed on that model's training images only
-    def __init__(self, X, L):
-        x = X.float().div(255)
-        self.mean = x.mean(dim=(0, 2, 3)).to(DEVICE); self.std = x.std(dim=(0, 2, 3)).to(DEVICE)
-        self.lmean, self.lstd = L.mean().item(), L.std().item() + 1e-6
-
-def prep(xb, bgb, cfg, st, train):
-    x = xb.to(DEVICE, non_blocking=True).float().div_(255)
-    if train and cfg['aug'] is not None:
-        x = gpu_augment(x, bgb.to(DEVICE), cfg['aug'])
-    if cfg['normalize']:
-        x = (x - st.mean.view(1, 3, 1, 1)) / st.std.view(1, 3, 1, 1)
-    return x
-
-def make_opt(model, cfg):
-    if cfg['opt'] == 'adamw':
-        decay = [p for p in model.parameters() if p.ndim > 1]
-        no_decay = [p for p in model.parameters() if p.ndim <= 1]
-        return torch.optim.AdamW([{'params': decay, 'weight_decay': cfg['wd']},
-                                  {'params': no_decay, 'weight_decay': 0.0}], lr=cfg['lr'])
-    return torch.optim.Adam(model.parameters(), lr=cfg['lr'])
-
 @torch.no_grad()
-def predict_proba(model, X, bg, L, cfg, st, tta=False, bs=64):
-    model.eval(); out = []
-    for i in range(0, len(X), bs):
-        x = prep(X[i:i + bs], bg[i:i + bs], cfg, st, train=False)
-        s = ((L[i:i + bs] - st.lmean) / st.lstd).to(DEVICE)
-        views = tta_views(x, cfg['aug']) if tta else [x]
-        with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=DEVICE.type == 'cuda'):
-            p = torch.stack([F.softmax(model(v, s).float(), 1) for v in views]).mean(0)
-        out.append(p.cpu())
-    return torch.cat(out).numpy()
+def predict_proba(model, X, tta=False):
+    # X: N x 3 x 128 x 128 float in [0,1]; returns N x 15 class probabilities
+    model.eval()
+    views = [X] if not tta else [torch.rot90(v, k, dims=(2, 3)) for v in (X, X.flip(3)) for k in range(4)]
+    return torch.stack([torch.cat([F.softmax(model(v[i:i + 128]), 1) for i in range(0, len(v), 128)]) for v in views]).mean(0)
 
-def nll(p, y):
-    return float(-np.log(p[np.arange(len(y)), y] + 1e-8).mean())
+def accuracy_of(model, X, y, tta=False):
+    return (predict_proba(model, X, tta).argmax(1) == y).float().mean().item()
 
-def train_model(cfg, idx, seed, va_idx=None, eval_every=5):
-    # idx / va_idx index into the training images
-    seed_everything(seed)
-    X, bg, L = data_at(cfg)
-    Xt, bgt, Lt = X[idx].to(DEVICE), bg[idx].to(DEVICE), L[idx].to(DEVICE)
-    yt = torch.as_tensor(y_all[idx]).to(DEVICE)
-    st = Stats(X[idx], L[idx])
-    model = build_model(cfg).to(DEVICE).to(memory_format=torch.channels_last)
-    opt = make_opt(model, cfg)
-    steps = len(idx) // cfg['bs']; total = steps * cfg['epochs']           # drop_last: every step is a full batch
-    sched = (torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg['lr'], total_steps=total, pct_start=0.15)
-             if cfg['sched'] == 'onecycle' else None)
-    scaler = torch.amp.GradScaler('cuda', enabled=DEVICE.type == 'cuda')
-    crit = nn.CrossEntropyLoss(label_smoothing=cfg['label_smoothing'])
-    sub = np.arange(0, len(idx), max(1, len(idx) // 120))                  # fixed train subset for clean curves
-    hist = {k: [] for k in ['epoch', 'train_loss', 'train_acc', 'val_loss', 'val_acc']}
-    for ep in range(cfg['epochs']):
-        model.train(); perm = torch.randperm(len(idx), device=DEVICE)
-        for b in range(steps):
-            j = perm[b * cfg['bs']:(b + 1) * cfg['bs']]
-            x = prep(Xt[j], bgt[j], cfg, st, train=True).contiguous(memory_format=torch.channels_last)
-            s = (Lt[j] - st.lmean) / st.lstd
-            with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=DEVICE.type == 'cuda'):
-                loss = crit(model(x, s).float(), yt[j])
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-            if sched: sched.step()
-        if va_idx is not None and ((ep + 1) % eval_every == 0 or ep == cfg['epochs'] - 1):
-            pt = predict_proba(model, X[idx[sub]], bg[idx[sub]], L[idx[sub]], cfg, st)
-            pv = predict_proba(model, X[va_idx], bg[va_idx], L[va_idx], cfg, st)
-            hist['epoch'].append(ep + 1)
-            hist['train_loss'].append(nll(pt, y_all[idx[sub]])); hist['train_acc'].append(float((pt.argmax(1) == y_all[idx[sub]]).mean()))
-            hist['val_loss'].append(nll(pv, y_all[va_idx])); hist['val_acc'].append(float((pv.argmax(1) == y_all[va_idx]).mean()))
-    model.st = st
+def train_model(cfg, seed, idx):
+    # train one model on the training images idx; returns the model and its per-epoch history
+    set_seed(seed)
+    model = build_model(cfg).to(DEV)
+    if cfg['opt'] == 'adam':
+        opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'], weight_decay=cfg.get('wd', 0))
+    else:
+        opt = torch.optim.SGD(model.parameters(), lr=cfg['lr'])
+    epochs = cfg['epochs'] if not QUICK else 2
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs) if cfg.get('cosine') else None
+    idx = torch.as_tensor(idx, device=DEV)
+    hist = {'train_loss': [], 'val_acc': [], 'val_rot_acc': []}
+    for ep in range(epochs):
+        model.train(); total = 0.0
+        order = idx[torch.randperm(len(idx), device=DEV)]
+        for i in range(0, len(order), cfg['bs']):
+            b = order[i:i + cfg['bs']]
+            xb, yb = X_all_d[b].float() / 255, y_all_d[b]
+            if cfg['aug']:
+                xb = augment(xb)
+            loss = F.cross_entropy(model(xb), yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+            total += loss.item() * len(b)
+        if sched:
+            sched.step()
+        hist['train_loss'].append(total / len(idx))
+        if cfg.get('track', True):
+            hist['val_acc'].append(accuracy_of(model, val_x, val_y))
+            hist['val_rot_acc'].append(accuracy_of(model, val_x_rot, val_y))
     return model, hist
 
-def cross_validate(cfg, name='', keep_models=False, seed_offset=0, verbose=True):
-    cfg = quick(cfg); t = time.time()
-    X, bg, L = data_at(cfg)
-    oof, oof_tta = np.zeros((NTR, N_CLASSES)), np.zeros((NTR, N_CLASSES))
-    hists, models = [], []
-    for f, (tr, va) in enumerate(FOLDS):
-        model, h = train_model(cfg, tr, seed=f + seed_offset, va_idx=va)
-        oof[va] = predict_proba(model, X[va], bg[va], L[va], cfg, model.st)
-        oof_tta[va] = predict_proba(model, X[va], bg[va], L[va], cfg, model.st, tta=True)
-        hists.append(h)
-        if keep_models: models.append(model.cpu())
-        del model
-    fold_acc = lambda P: [float((P[va].argmax(1) == y_all[va]).mean()) for _, va in FOLDS]
-    r = dict(name=name, cfg=cfg, oof=oof, oof_tta=oof_tta, fold_acc=fold_acc(oof), fold_acc_tta=fold_acc(oof_tta),
-             hists=hists, models=models, secs=time.time() - t)
-    r['mean'] = float(np.mean(r['fold_acc']))
-    if verbose:
-        print(f"{name:52s} {r['mean']*100:5.1f}%  folds {[round(a * 100, 1) for a in r['fold_acc']]}  "
-              f"(TTA {np.mean(r['fold_acc_tta'])*100:.1f}%, {r['secs']:.0f}s)")
-    return r
+LOG, RUNS = [], {}
+def log_row(step, change, reason, cfg, va, vr, models, hists, seconds):
+    RUNS[step] = dict(cfg=cfg, val=va, val_rot=vr, models=models, hists=hists)
+    LOG.append({'step': step, 'change': change, 'reason': reason,
+                'val acc': f'{np.mean(va):.3f} ± {np.std(va):.3f}', 'rotated val acc': f'{np.mean(vr):.3f} ± {np.std(vr):.3f}',
+                'seconds': round(seconds)})
+    print(f"{step}: val {np.mean(va):.3f} ± {np.std(va):.3f} | rotated val {np.mean(vr):.3f} ± {np.std(vr):.3f} "
+          f"| rotated val per seed {[round(v, 3) for v in vr]} | {seconds:.0f}s")
 
-def with_tta(r, name):
-    # inference-only change: same models, predictions averaged over test-time views
-    return dict(r, name=name, oof=r['oof_tta'], fold_acc=r['fold_acc_tta'], mean=float(np.mean(r['fold_acc_tta'])), secs=0.0)
+def run_experiment(step, change, reason, cfg):
+    # train cfg once per seed; score on the upright and the rotated validation sets
+    t0 = time.time(); va, vr, models, hists = [], [], [], []
+    for s in SEEDS:
+        model, h = train_model(cfg, s, tr_idx)
+        va.append(accuracy_of(model, val_x, val_y)); vr.append(accuracy_of(model, val_x_rot, val_y))
+        models.append(model); hists.append(h)
+    log_row(step, change, reason, cfg, va, vr, models, hists, time.time() - t0)
 
-def compare(a, b):
-    # paired comparison of result b against result a on the same folds / images
-    d = np.array(b['fold_acc']) - np.array(a['fold_acc'])
-    half = stats.t.ppf(0.975, len(d) - 1) * d.std(ddof=1) / math.sqrt(len(d)) if len(d) > 1 else np.nan
-    ca, cb = a['oof'].argmax(1) == y_all, b['oof'].argmax(1) == y_all
-    fixed, broke = int((~ca & cb).sum()), int((ca & ~cb).sum())
-    p = stats.binomtest(fixed, fixed + broke, 0.5).pvalue if fixed + broke else 1.0
-    return dict(gain=d.mean() * 100, ci=half * 100, folds_up=f'{int((d > 0).sum())}/{len(d)}', fixed=fixed, broke=broke, p_mcnemar=p)
+def tta_row(step, from_step, change, reason):
+    # inference-only change: the SAME trained models, predictions averaged over 8 views
+    t0 = time.time(); r = RUNS[from_step]
+    va = [accuracy_of(m, val_x, val_y, tta=True) for m in r['models']]
+    vr = [accuracy_of(m, val_x_rot, val_y, tta=True) for m in r['models']]
+    log_row(step, change, reason, dict(r['cfg'], tta=True), va, vr, r['models'], r['hists'], time.time() - t0)
 """)
 
 # --------------------------------------------------------------------------
 md(r"""
-## 5. Experiments
-
-### 5.1 Ablation: one change at a time
-Each row adds exactly **one** change to the row above, on the same five folds and seeds. The order follows the diagnosis: fix what is broken first, then reduce overfitting, then refine. The cheap rows run at 64 px; resolution is raised once, near the end.
+## 5. Experiment log: fixing the starter's small CNN, one change at a time
+Each row keeps everything from the row above and changes **one** thing. Every row is trained with the 3 seeds, and the table shows mean ± standard deviation over the seeds.
 """)
 code(r"""
-def cfg_with(base, **kw):
-    c = copy.deepcopy(base); c.update(kw); return c
+cfg = dict(model='small', width=16, bn=False, size=64, normalize=False, opt='sgd', lr=0.05, bs=256, epochs=5, aug=False)
+run_experiment('E0', 'starter settings', 'baseline: 64 px, batch 256, 5 epochs, SGD lr 0.05', cfg)
 
-STARTER_LIKE = cfg_with(BASE, arch='plain', res=64, crop=False, epochs=30, opt='adam', lr=1e-3, wd=0.0, sched=None,
-                        label_smoothing=0.0, aug=None, normalize=False, dropout=0.0)
-steps = [('A0 starter-like: plain CNN, 64px, raw pixels, 30 ep', STARTER_LIKE)]
-def add(name, **kw):
-    steps.append((name, cfg_with(steps[-1][1], **kw)))
+cfg = dict(cfg, bs=32, epochs=40)
+run_experiment('E1', 'batch 256 -> 32, epochs 5 -> 40', '10 updates are far too few: now 600 updates', cfg)
 
-add('A1 + standardise inputs (train-fold mean/std)', normalize=True)
-add('A2 + crop to leaf (rotation-safe square)', crop=True)
-add('A3 + LeafNet (BatchNorm, residual, GAP, dropout .3)', arch='leafnet', dropout=0.3)
-add('A4 + train 4x longer (120 epochs)', epochs=BASE['epochs'])
-add('A5 + augmentation (mirror, +-20 deg, zoom, shift, light)', aug=AUG)
-add('A6 + AdamW weight decay 0.05', opt='adamw', wd=BASE['wd'])
-add('A7 + one-cycle LR schedule (peak 2e-3)', sched='onecycle', lr=BASE['lr'])
-add('A8 + label smoothing 0.1', label_smoothing=0.1)
-add('A9 + resolution 64 -> 192 px', res=BASE['res'])
+cfg = dict(cfg, opt='adam', lr=1e-3)
+run_experiment('E2', 'SGD lr 0.05 -> Adam lr 1e-3', 'per-parameter adaptive steps converge faster', cfg)
 
-# rows whose models are needed later for the evidence plots, picked by config rather than by name
-NOAUG_ROW = [n for n, c in steps if c['arch'] == 'leafnet' and c['aug'] is None][-1]
-AUG_ROW = next(n for n, c in steps if c['aug'] is not None)
-HIRES_ROW = steps[-1][0]
+cfg = dict(cfg, size=128)
+run_experiment('E3', '64 -> 128 px input', 'keep fine detail: margin teeth, veins, stem', cfg)
 
-results = {}
-for name, cfg in steps:
-    results[name] = cross_validate(cfg, name, keep_models=name in (NOAUG_ROW, AUG_ROW, HIRES_ROW))
-TTA_ROW = 'A10 + test-time augmentation (mirror)'
-results[TTA_ROW] = with_tta(results[HIRES_ROW], TTA_ROW)
-""")
-code(r"""
-def ablation_table(names):
-    rows = []
-    for i, n in enumerate(names):
-        r = results[n]; row = {'step': n, 'CV acc %': r['mean'] * 100, 'fold sd': np.std(r['fold_acc'], ddof=1) * 100,
-                               'macro F1': f1_score(y_all, r['oof'].argmax(1), average='macro')}
-        if i:
-            c = compare(results[names[i - 1]], r)
-            row.update({'gain %': c['gain'], '95% CI ±': c['ci'], 'folds up': c['folds_up'],
-                        'fixed/broke': f"{c['fixed']}/{c['broke']}", 'McNemar p': c['p_mcnemar']})
-        row['train s'] = round(r['secs']); rows.append(row)
-    return pd.DataFrame(rows)
+cfg = dict(cfg, normalize=True)
+run_experiment('E4', 'standardise inputs', 'zero-mean, unit-variance inputs suit the initialisation', cfg)
 
-names = list(results)
-display(ablation_table(names).round(3))
+cfg = dict(cfg, bn=True)
+run_experiment('E5', 'add batch normalisation', 'keeps activations well scaled; faster, more stable training', cfg)
 
-fig, ax = plt.subplots(figsize=(12, 4.5))
-m = [results[n]['mean'] * 100 for n in names]
-ax.bar(range(len(names)), m, color='#4C72B0', alpha=.8)
-for i, n in enumerate(names):
-    ax.scatter([i] * N_FOLDS, np.array(results[n]['fold_acc']) * 100, color='k', s=10, zorder=3)
-    ax.text(i, m[i] + 1, f'{m[i]:.1f}', ha='center', fontsize=8)
-ax.set_xticks(range(len(names))); ax.set_xticklabels([n.split(' ', 1)[0] for n in names])
-ax.set_ylabel('5-fold CV accuracy (%)'); ax.set_title('Ablation: each bar adds one change (dots = the 5 folds)')
-ax.grid(axis='y', alpha=.3); plt.tight_layout(); plt.show()
-""")
+cfg = dict(cfg, aug=True)
+run_experiment('E6', 'rotation / shift / mirror augmentation', 'test leaves are rotated and shifted; train for that', cfg)
 
-md(r"""
-### 5.2 Choices made by cross-validation, and the noise floor
-Starting from A9 (192 px), each experiment changes one setting:
-* **noise floor:** A9 again, with fresh seeds. Any gain smaller than this gap is noise;
-* **rotation range:** ±45° and ±180° (with matching test-time views) against ±20°;
-* **resolution:** 128 and 256 px against 192;
-* **leaf size:** the leaf's length given to the classifier as an extra input.
-""")
-code(r"""
-A9 = results[HIRES_ROW]
-exp = {'A9 (reference)': A9}
-exp['noise: A9 with fresh seeds'] = cross_validate(steps[-1][1], 'noise: A9 with fresh seeds', seed_offset=1000)
-for deg in (45, 180):
-    exp[f'rotation +-{deg}'] = cross_validate(cfg_with(steps[-1][1], aug=make_aug(deg)), f'rotation +-{deg} deg')
-for res in (128, 256):
-    exp[f'res {res}'] = cross_validate(cfg_with(steps[-1][1], res=res), f'resolution {res}px')
-exp['+ leaf size input'] = cross_validate(cfg_with(steps[-1][1], use_size=True), '+ leaf length as extra input')
+cfg = dict(cfg, epochs=80, cosine=True)
+run_experiment('E7', '40 -> 80 epochs with cosine LR decay', 'augmented data is harder to fit: more time, then small steps', cfg)
 
-rows = []
-for n, r in exp.items():
-    c = compare(A9, r) if n != 'A9 (reference)' else {}
-    rows.append({'experiment': n, 'CV acc %': r['mean'] * 100, 'CV acc with TTA %': np.mean(r['fold_acc_tta']) * 100,
-                 'gain vs A9 %': c.get('gain', np.nan), '95% CI ±': c.get('ci', np.nan),
-                 'fixed/broke': f"{c['fixed']}/{c['broke']}" if c else '', 'McNemar p': c.get('p_mcnemar', np.nan)})
-exp_table = pd.DataFrame(rows); display(exp_table.round(3))
-NOISE = abs(exp['noise: A9 with fresh seeds']['mean'] - A9['mean']) * 100
-print(f'noise floor (same config, different seeds): {NOISE:.2f} points of CV accuracy')
+cfg = dict(cfg, width=32)
+run_experiment('E8', 'width 16 -> 32 channels', 'more filters to cover leaves seen at every angle', cfg)
+
+tta_row('E9', 'E8', 'test-time augmentation (8 views)', 'average over rotations: steadier on rotated leaves')
 """)
 
 # --------------------------------------------------------------------------
-md("## 6. Evidence for each change")
 md(r"""
-### 6.1 Learning curves: memorisation before vs after
-Train (fixed subset, scored like validation) vs validation, fold 1. A large gap with ~100% train accuracy means the model memorises the training images.
+## 6. ImageNet-pretrained ResNet-18 (fine-tuned)
+The handout allows ImageNet-pretrained backbones. A pretrained ResNet-18 already has general-purpose filters (edges, textures, shapes), so 480 images only need to adapt them rather than learn them from scratch. The images are upsampled to 224 px, the size the backbone was trained on, and standardised with ImageNet statistics. The whole network is fine-tuned with Adam at a small learning rate.
+
+P1 tests whether pretraining alone fixes the rotation problem; P2 adds the augmentation; P3 adds TTA (same models as P2).
 """)
 code(r"""
-show = [names[0], NOAUG_ROW, AUG_ROW, HIRES_ROW]
-fig, axes = plt.subplots(2, len(show), figsize=(4.3 * len(show), 7), squeeze=False)
-for j, n in enumerate(show):
-    h = results[n]['hists'][0]; tag = n.split(' ', 1)[0]
-    axes[0, j].plot(h['epoch'], h['train_loss'], label='train'); axes[0, j].plot(h['epoch'], h['val_loss'], label='val')
-    axes[0, j].set_title(f'{tag}: cross-entropy'); axes[0, j].legend()
-    axes[1, j].plot(h['epoch'], h['train_acc'], label='train'); axes[1, j].plot(h['epoch'], h['val_acc'], label='val')
-    axes[1, j].set_title(f'{tag}: accuracy'); axes[1, j].set_ylim(0, 1.02); axes[1, j].legend(); axes[1, j].set_xlabel('epoch')
+rcfg = dict(model='resnet18', size=224, opt='adam', lr=3e-4, wd=1e-4, bs=32, epochs=25, cosine=True, aug=False)
+run_experiment('P1', 'ImageNet-pretrained ResNet-18, no augmentation', 'transfer learning, but trained on upright leaves only', rcfg)
+
+rcfg = dict(rcfg, aug=True)
+run_experiment('P2', '+ rotation / shift / mirror augmentation', 'same fix as E6', rcfg)
+
+tta_row('P3', 'P2', '+ test-time augmentation (8 views)', 'same as E9')
+FINAL_CFG = rcfg
+""")
+code(r"""
+log_df = pd.DataFrame(LOG)
+pd.set_option('display.max_colwidth', 80)
+display(log_df)
+
+steps = [r['step'] for r in LOG]
+fig, ax = plt.subplots(figsize=(12, 4))
+for j, (key, lab) in enumerate([('val', 'validation (upright)'), ('val_rot', 'rotated validation (test-like)')]):
+    m = [np.mean(RUNS[s][key]) for s in steps]; sd = [np.std(RUNS[s][key]) for s in steps]
+    ax.bar(np.arange(len(steps)) + (j - .5) * .4, m, .4, yerr=sd, capsize=3, label=lab)
+ax.set_xticks(range(len(steps))); ax.set_xticklabels(steps); ax.set_ylabel('accuracy (mean ± sd over 3 seeds)')
+ax.axhline(1 / 15, color='k', ls=':', lw=1, label='chance'); ax.legend(); ax.grid(axis='y', alpha=.3)
+ax.set_title('Experiment log'); plt.tight_layout(); plt.show()
+""")
+
+# --------------------------------------------------------------------------
+md(r"""
+### Evidence for the key changes
+**(a) Learning curves.** Seed-0 curves for the starter settings (E0), for E1 (enough updates), for E5 (no augmentation) and for E6 (augmentation). The curves show when the network starts to learn and when the upright and rotated validation accuracies diverge.
+""")
+code(r"""
+fig, axes = plt.subplots(1, 4, figsize=(18, 3.8))
+for ax, s in zip(axes, ['E0', 'E1', 'E5', 'E6']):
+    h = RUNS[s]['hists'][0]; ep = np.arange(1, len(h['train_loss']) + 1)
+    ax.plot(ep, h['val_acc'], label='val acc (upright)'); ax.plot(ep, h['val_rot_acc'], label='val acc (rotated)')
+    ax2 = ax.twinx(); ax2.plot(ep, h['train_loss'], 'k--', lw=1, label='train loss'); ax2.set_ylabel('train loss')
+    ax.set_ylim(0, 1); ax.set_xlabel('epoch'); ax.set_title(s); ax.legend(loc='center right', fontsize=7)
 plt.tight_layout(); plt.show()
-for n in show:
-    h = results[n]['hists'][0]
-    print(f"{n.split(' ', 1)[0]}: final train acc {h['train_acc'][-1]:.2f}, val acc {h['val_acc'][-1]:.2f}, "
-          f"gap {h['train_acc'][-1] - h['val_acc'][-1]:.2f}")
 """)
-
 md(r"""
-### 6.2 Robustness to small changes in how the leaf lies
-The fold-1 models of the row before augmentation and the row with augmentation (same epochs, same everything else) classify the fold-1 validation leaves after a fixed rotation. The crop square is rotation-safe, so no part of the leaf leaves the frame.
+**(b) What the CNN is and is not invariant to.** The seed-0 models from E5 (no augmentation) and E6 (augmentation) classify the validation leaves after a fixed rotation. A convolution slides the same filter over every position, and pooling summarises over neighbourhoods, so a CNN copes reasonably well with *shifts*. Nothing in the architecture handles *rotation*: the model has to learn it from rotated examples.
 """)
 code(r"""
-def rotate_u8(X, bg, deg):
-    x = X.float().div(255); B = len(x); a = math.radians(deg)
-    theta = torch.tensor([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0]], dtype=torch.float32).repeat(B, 1, 1)
-    grid = F.affine_grid(theta, list(x.shape), align_corners=False); bgv = bg.view(B, 3, 1, 1)
-    return ((F.grid_sample(x - bgv, grid, align_corners=False) + bgv).clamp(0, 1) * 255).round().to(torch.uint8)
-
-angles = list(range(-60, 61, 10))
-tr, va = FOLDS[0]
-fig, ax = plt.subplots(figsize=(7.5, 4))
-for n in (NOAUG_ROW, AUG_ROW):
-    r = results[n]; cfg = r['cfg']; model = r['models'][0].to(DEVICE)
-    X, bg, L = data_at(cfg)
-    acc = [float((predict_proba(model, rotate_u8(X[va], bg[va], d), bg[va], L[va], cfg, model.st).argmax(1) == y_all[va]).mean())
-           for d in angles]
-    ax.plot(angles, np.array(acc) * 100, marker='o', label=f"{n.split(' ', 1)[0]} ({'no aug' if cfg['aug'] is None else 'aug'})")
-    model.cpu()
-ax.axvspan(-20, 20, color='g', alpha=.07, label='training rotation range')
-ax.set_xlabel('rotation applied to validation leaves (deg)'); ax.set_ylabel('accuracy (%)'); ax.legend(); ax.grid(alpha=.3)
-ax.set_title('Accuracy vs rotation (fold 1)'); plt.tight_layout(); plt.show()
-""")
-
-md("### 6.3 Where the final configuration still makes mistakes (out-of-fold confusion matrix)")
-code(r"""
-best = results[TTA_ROW]
-pred = best['oof'].argmax(1)
-cm = confusion_matrix(y_all, pred, labels=range(N_CLASSES))
-fig, ax = plt.subplots(figsize=(8, 7))
-im = ax.imshow(cm, cmap='Blues'); plt.colorbar(im, fraction=.046)
-ax.set_xticks(range(N_CLASSES)); ax.set_yticks(range(N_CLASSES))
-ax.set_xticklabels(CLASSES, rotation=90, fontsize=8); ax.set_yticklabels(CLASSES, fontsize=8)
-for i in range(N_CLASSES):
-    for j in range(N_CLASSES):
-        if cm[i, j]:
-            ax.text(j, i, cm[i, j], ha='center', va='center', fontsize=7, color='w' if cm[i, j] > cm.max() / 2 else 'k')
-ax.set_xlabel('predicted'); ax.set_ylabel('true'); ax.set_title('Out-of-fold predictions, A10')
-plt.tight_layout(); plt.show()
-per_class = pd.Series(cm.diagonal() / cm.sum(1), index=CLASSES).sort_values()
-print('per-class accuracy, worst first (%):'); print((per_class * 100).round(1).head(8).to_string())
-off = sorted([(int(cm[i, j]), CLASSES[i], CLASSES[j]) for i in range(N_CLASSES) for j in range(N_CLASSES) if i != j and cm[i, j]], reverse=True)
-print('most confused (count, true -> predicted):', off[:6])
-if off:
-    _, a, b = off[0]
-    fig, axes = plt.subplots(1, 6, figsize=(14, 2.8))
-    ia, ib = np.where(y_all == CLS2IDX[a])[0][:3], np.where(y_all == CLS2IDX[b])[0][:3]
-    for ax, k in zip(axes, list(ia) + list(ib)):
-        ax.imshow(CROP[k].permute(1, 2, 0)); ax.set_title(CLASSES[y_all[k]], fontsize=8); ax.axis('off')
-    plt.suptitle(f'The most confused pair: {a} vs {b}'); plt.tight_layout(); plt.show()
-""")
-
-md(r"""
-### 6.4 What the network looks at (Grad-CAM)
-Grad-CAM weights a convolutional feature map by the gradient of the predicted class score. It is computed on the third residual stage (12×12 at 192 px) of the fold-1 A9 model. The number printed below is the share of the heat that falls inside the leaf mask, averaged over all fold-1 validation leaves. If it is well above the leaf's share of the image, the model is using the leaf rather than the background or scan artefacts.
-""")
-code(r"""
-def grad_cam(model, x, size, cls, layer):
-    model.eval(); feats = {}
-    h = layer.register_forward_hook(lambda m, i, o: feats.__setitem__('a', o))
-    logits = model(x, size); a = feats['a']; h.remove()
-    g = torch.autograd.grad(logits[torch.arange(len(x)), cls].sum(), a)[0]
-    cam = F.relu((g.mean(dim=(2, 3), keepdim=True) * a).sum(1, keepdim=True))
-    cam = F.interpolate(cam, size=x.shape[-2:], mode='bilinear', align_corners=False)
-    return (cam / (cam.amax(dim=(2, 3), keepdim=True) + 1e-8))[:, 0].detach().cpu()
-
-r = results[HIRES_ROW]; cfg = r['cfg']; model = r['models'][0].to(DEVICE).float()
-tr, va = FOLDS[0]
-X, bg, L = data_at(cfg)
-cams, preds = [], []
-for i in range(0, len(va), 32):
-    vi = va[i:i + 32]
-    xin = prep(X[vi], bg[vi], cfg, model.st, train=False)
-    s = ((L[vi] - model.st.lmean) / model.st.lstd).to(DEVICE)
-    with torch.enable_grad():
-        p = model(xin, s).argmax(1); cams.append(grad_cam(model, xin, s, p, model.blocks[2])); preds.append(p.cpu())
-cams, preds = torch.cat(cams), torch.cat(preds)
-Xv = X[va].float().div(255)
-leaf = ((Xv - bg[va].view(-1, 3, 1, 1)).abs().amax(1) > THR / 255).float()
-inside = (cams * leaf).sum((1, 2)) / (cams.sum((1, 2)) + 1e-8)
-print(f'share of Grad-CAM heat on the leaf: {inside.mean():.2f} (leaf covers {leaf.mean():.2f} of the image)')
-fig, axes = plt.subplots(2, 6, figsize=(16, 6))
-for k, ax in enumerate(axes.flat):
-    ax.imshow(Xv[k].permute(1, 2, 0)); ax.imshow(cams[k], cmap='jet', alpha=.4); ax.axis('off')
-    ok = preds[k].item() == y_all[va][k]
-    ax.set_title(f"{'✓' if ok else '✗'} {CLASSES[preds[k]]}", fontsize=8, color='g' if ok else 'r')
-plt.suptitle('Grad-CAM, fold-1 validation leaves (A9 model, stage-3 features)'); plt.tight_layout(); plt.show()
-_ = model.cpu()
+angles = list(range(-180, 181, 30))
+fig, ax = plt.subplots(figsize=(8, 3.8))
+for s in ['E5', 'E6']:
+    model = RUNS[s]['models'][0]
+    acc = [accuracy_of(model, torch.stack([rotate_shift(x, a, 0, 0) for x in val_x]), val_y) for a in angles]
+    ax.plot(angles, acc, marker='o', label=f"{s} ({'with' if RUNS[s]['cfg']['aug'] else 'no'} augmentation)")
+shift_acc = [accuracy_of(RUNS['E5']['models'][0], torch.stack([rotate_shift(x, 0, d, d) for x in val_x]), val_y) for d in (0, 5, 10)]
+ax.set_xlabel('rotation applied to validation leaves (deg)'); ax.set_ylabel('accuracy'); ax.set_ylim(0, 1.02)
+ax.set_xticks(angles); ax.grid(alpha=.3); ax.legend(); ax.set_title('Accuracy vs rotation (seed 0)'); plt.tight_layout(); plt.show()
+print('E5 (no augmentation) accuracy after shifting by 0 / 5 / 10 px:', [round(a, 3) for a in shift_acc])
 """)
 
 # --------------------------------------------------------------------------
 md(r"""
-## 7. Final model and test predictions
-The final configuration takes A9, plus each choice from 5.2 whose gain is larger than the noise floor. It is cross-validated once more with **fresh seeds**, which gives an unbiased estimate of accuracy after choosing settings on the earlier runs. The test prediction averages the softmax outputs of an ensemble: the 5 cross-validation models plus `N_FULL` models trained on all 600 images (different seeds), each with the test-time views that match its augmentation.
+## 7. Final model
+**Final configuration:** ImageNet-pretrained ResNet-18 (torchvision `IMAGENET1K_V1`), with a new 15-way linear layer and the whole network fine-tuned.
+* Preprocessing: 128 px images upsampled to 224 px, ImageNet mean/std standardisation.
+* Augmentation: rotation by any angle, shift of up to 10 px, random left-right mirror.
+* Optimiser and schedule: Adam, learning rate 3e-4, weight decay 1e-4, cosine decay over 25 epochs, batch size 32.
+* Test-time augmentation: average over 8 rotations/mirrors.
+
+Its validation numbers are row P3 of the log (3 seeds). Below: the confusion matrix on the rotated validation set (all 3 seeds pooled), then misclassified examples.
 """)
 code(r"""
-FINAL = copy.deepcopy(steps[-1][1])
-for key, cand in [('aug', ['rotation +-45', 'rotation +-180']), ('res', ['res 128', 'res 256']), ('use_size', ['+ leaf size input'])]:
-    best_c = max(cand, key=lambda n: np.mean(exp[n]['fold_acc_tta']))
-    gain = (np.mean(exp[best_c]['fold_acc_tta']) - np.mean(A9['fold_acc_tta'])) * 100
-    if gain > NOISE:
-        FINAL[key] = copy.deepcopy(exp[best_c]['cfg'][key])
-        print(f'{key}: adopt {best_c!r} (+{gain:.2f} > noise {NOISE:.2f})')
-    else:
-        print(f'{key}: keep A9 setting ({best_c!r} gain {gain:+.2f} <= noise {NOISE:.2f})')
-print('FINAL config:', {k: FINAL[k] for k in ('res', 'crop', 'epochs', 'use_size')}, 'rotation', FINAL['aug']['rot_deg'])
+from sklearn.metrics import confusion_matrix
+P3 = RUNS['P3']
+print(f"Final config, 3 seeds: validation {np.mean(P3['val']):.3f} ± {np.std(P3['val']):.3f}, "
+      f"rotated validation {np.mean(P3['val_rot']):.3f} ± {np.std(P3['val_rot']):.3f}")
+preds = [predict_proba(m, val_x_rot, tta=True).argmax(1).cpu().numpy() for m in P3['models']]
+truth = np.tile(val_y.cpu().numpy(), len(preds)); pred_all = np.concatenate(preds)
+cm = confusion_matrix(truth, pred_all, labels=range(15))
+fig, ax = plt.subplots(figsize=(7.5, 6.5))
+ax.imshow(cm, cmap='Blues')
+for i in range(15):
+    for j in range(15):
+        if cm[i, j]: ax.text(j, i, cm[i, j], ha='center', va='center', fontsize=7, color='w' if cm[i, j] > cm.max() / 2 else 'k')
+ax.set_xticks(range(15)); ax.set_yticks(range(15))
+ax.set_xticklabels([c[-2:] for c in CLASSES]); ax.set_yticklabels(CLASSES, fontsize=8)
+ax.set_xlabel('predicted species'); ax.set_ylabel('true species')
+ax.set_title('Rotated validation set, final config, 3 seeds pooled (8 x 3 = 24 per row)'); plt.tight_layout(); plt.show()
+off = sorted([(int(cm[i, j]), CLASSES[i], CLASSES[j]) for i in range(15) for j in range(15) if i != j and cm[i, j]], reverse=True)
+print('most frequent confusions (count, true -> predicted):', off[:8])
 
-final_cv = cross_validate(FINAL, 'FINAL, fresh seeds', keep_models=True, seed_offset=2000)
-print(f"FINAL CV accuracy with TTA: {np.mean(final_cv['fold_acc_tta']) * 100:.1f}% "
-      f"(folds {[round(a * 100, 1) for a in final_cv['fold_acc_tta']]})")
+wrong = np.where(preds[0] != val_y.cpu().numpy())[0]
+print(f'seed-0 model misclassifies {len(wrong)} of {len(val_y)} rotated validation images')
+if len(wrong):
+    fig, axes = plt.subplots(1, min(8, len(wrong)), figsize=(2.2 * min(8, len(wrong)), 2.8), squeeze=False)
+    for ax, k in zip(axes[0], wrong[:8]):
+        ax.imshow(val_x_rot[k].cpu().permute(1, 2, 0)); ax.axis('off')
+        ax.set_title(f'true {CLASSES[val_y[k]][-2:]}\npred {CLASSES[preds[0][k]][-2:]}', fontsize=8, color='r')
+    plt.suptitle('Misclassified rotated validation images (seed 0)'); plt.tight_layout(); plt.show()
+""")
+md(r"""
+*(Interpretation of the confusion matrix and the misclassified examples: see the summary.)*
 
-N_FULL = 0 if QUICK else 3
-ensemble = list(final_cv['models'])
-for s in range(N_FULL):
-    m, _ = train_model(quick(FINAL), np.arange(NTR), seed=3000 + s); ensemble.append(m.cpu())
-    print(f'full-data model {s + 1}/{N_FULL} trained')
-
-X, bg, L = data_at(quick(FINAL))
-te = np.arange(NTR, len(X))
-probs = []
-for m in ensemble:
-    m.to(DEVICE); probs.append(predict_proba(m, X[te], bg[te], L[te], quick(FINAL), m.st, tta=True)); m.cpu()
-test_prob = np.mean(probs, 0); test_pred = test_prob.argmax(1)
-agree = np.mean([(p.argmax(1) == test_pred).mean() for p in probs])
-print(f'{len(ensemble)} models; single models agree with the ensemble on {agree * 100:.1f}% of test images')
+### Predictions for the test set
+The final configuration is retrained on **all 600 labelled images** with each of the 3 seeds (same settings, no validation hold-out). The test prediction averages the 3 models' TTA probabilities. The agreement between the individual seeds shows how stable the predictions are.
 """)
 code(r"""
-# predictions.csv: one row per test image (columns follow the handout / template if one was provided)
-if SUB_TEMPLATE is not None:
-    tmpl, idcol = SUB_TEMPLATE
-    name2pred = {p.name: CLASSES[k] for p, k in zip(test_paths, test_pred)} | {p.stem: CLASSES[k] for p, k in zip(test_paths, test_pred)}
-    sub = tmpl.copy(); labcol = [c for c in sub.columns if c != idcol][0]
-    sub[labcol] = sub[idcol].astype(str).map(name2pred)
-    assert sub[labcol].notna().all(), 'some template rows did not match a test image'
-else:
-    sub = pd.DataFrame({'filename': [p.name for p in test_paths], 'label': [CLASSES[k] for k in test_pred]})
-sub.to_csv('predictions.csv', index=False)
-print(sub.shape); display(sub.head())
-print('predicted class counts:', sub.iloc[:, -1].value_counts().sort_index().to_dict())
-print(f'total runtime: {(time.time() - T0) / 60:.1f} min')
+final_models = []
+for s in SEEDS:
+    m, _ = train_model(dict(FINAL_CFG, track=False), s, np.arange(len(y_all)))
+    final_models.append(m)
+X_te_f = X_te_d.float() / 255
+probs = [predict_proba(m, X_te_f, tta=True) for m in final_models]
+test_pred = torch.stack(probs).mean(0).argmax(1).cpu().numpy()
+for s, p in zip(SEEDS, probs):
+    print(f'seed {s}: agrees with the ensemble on {(p.argmax(1).cpu().numpy() == test_pred).mean():.3f} of test images')
+
+pred_df = pd.DataFrame({'id': sub_df.id, 'label': [CLASSES[k] for k in test_pred]})
+pred_df.to_csv('predictions.csv', index=False)
+check = pd.read_csv('predictions.csv')
+assert list(check.columns) == ['id', 'label'] and len(check) == 525 and check.id.tolist() == sub_df.id.tolist()
+print(check.shape); display(check.head())
+print('predicted test images per class:', check.label.value_counts().sort_index().to_dict())
 """)
 
+# --------------------------------------------------------------------------
 md(r"""
 ## 8. Summary
-*(Filled in from the results above: baseline accuracy, what was wrong, what each change did and the evidence, final CV accuracy.)*
+*(Filled in from the outputs above after the Colab run.)*
+
+## References and code sources
+* Starter notebook `LeafID_starter.ipynb` (course material): Section 2 is copied from it unchanged, and `SmallCNN` keeps its architecture.
+* PyTorch and torchvision documentation (models, `transforms.v2.functional.affine`, optimisers, LR schedulers): https://pytorch.org/docs, https://pytorch.org/vision
+* K. He, X. Zhang, S. Ren, J. Sun. *Deep Residual Learning for Image Recognition.* CVPR 2016 (ResNet). Pretrained weights: torchvision `ResNet18_Weights.IMAGENET1K_V1`.
+* S. Ioffe, C. Szegedy. *Batch Normalization.* ICML 2015.
+* D. P. Kingma, J. Ba. *Adam: A Method for Stochastic Optimization.* ICLR 2015.
+* I. Loshchilov, F. Hutter. *SGDR: Stochastic Gradient Descent with Warm Restarts.* ICLR 2017 (cosine schedule).
+* AI coding assistant (Claude) used as a coding aid; all code was checked and run by me.
 """)
 
 # ==========================================================================
 nb = nbf.v4.new_notebook()
 nb.cells = CELLS
-nb.metadata = {
-    "accelerator": "GPU",
-    "colab": {"provenance": [], "gpuType": "T4"},
-    "kernelspec": {"display_name": "Python 3", "name": "python3"},
-    "language_info": {"name": "python"},
-}
-out = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "LeafIDMir.ipynb")
+nb.metadata = {"accelerator": "GPU", "colab": {"provenance": [], "gpuType": "T4"},
+               "kernelspec": {"display_name": "Python 3", "name": "python3"}, "language_info": {"name": "python"}}
+out = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "LeafID_Rizwan_Mir.ipynb"
 nbf.write(nb, out)
 print("wrote", out, f"({len(CELLS)} cells)")
