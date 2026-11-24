@@ -42,12 +42,23 @@ md(r"""
 
 Every accuracy is given as **mean ± sample standard deviation over 3 seeds**, unless a line says otherwise.
 
-**Runtime:** Colab → Runtime → Change runtime type → **T4 GPU**, upload `leaves.zip` to `/content`, then Runtime → **Run all**.
+**Runtime:** Colab → Runtime → Change runtime type → **T4 GPU**, upload `leaves.zip` to `/content`, then Runtime → **Run all**. (On Kaggle: add `leaves.zip` as an input dataset, choose a GPU T4 accelerator with Internet on; the first cell copies the data to `/content`.)
 """)
 
 code(r"""
-import time
+import time, os, glob, shutil
 T_START = time.time()      # total run time is printed at the end of the notebook
+
+# Only on Kaggle: the uploaded dataset appears under /kaggle/input. Copy it to /content, where the starter
+# expects it (as leaves.zip, or as the already-unzipped folder holding train_labels.csv). Does nothing on Colab.
+if os.path.isdir('/kaggle/input') and not os.path.isdir('/content/leaves'):
+    os.makedirs('/content', exist_ok=True)
+    zips = glob.glob('/kaggle/input/**/leaves.zip', recursive=True)
+    if zips:
+        shutil.copy(zips[0], '/content/leaves.zip')
+    else:
+        shutil.copytree(os.path.dirname(glob.glob('/kaggle/input/**/train_labels.csv', recursive=True)[0]), '/content/leaves')
+    print('Kaggle: data copied to /content')
 """)
 
 # --------------------------------------------------------------------------
