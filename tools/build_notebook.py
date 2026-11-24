@@ -108,8 +108,6 @@ import os, math, random, copy
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 import torch, torch.nn as nn, torch.nn.functional as F
 import torchvision
-from torchvision.transforms.v2 import functional as TF
-from torchvision.transforms import InterpolationMode
 from PIL import Image
 
 DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -161,9 +159,16 @@ For each image we separate the leaf from the background. Every image has a singl
 * **orientation:** the angle of the leaf's long axis (the main eigenvector of the covariance of the leaf-pixel coordinates); 0° means vertical. An axis has no direction, so this angle cannot tell up from down;
 * **stem direction:** along that axis, which end is thinner (the sign of the third moment, i.e. the skew of the pixel positions along the axis). For an upright leaf the thin end (the stem) points down;
 * **position:** the centre of the leaf pixels, and its distance from the image centre;
-* **size and colour:** the fraction of the image covered by the leaf, and the mean green value of the leaf pixels.
+* **size and colour:** the fraction of the image covered by the leaf, and the mean green value of the leaf pixels;
+* **sharpness:** the mean absolute Laplacian (a pixel minus the average of its 4 neighbours) over leaf pixels. Blurring an image lowers it.
 """)
 code(r"""
+def sharpness(img):
+    g = img.float().mean(0).cpu().numpy()                     # grey image
+    g = g / 255 if img.dtype == torch.uint8 else g            # in [0, 1]
+    lap = np.abs(4 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:])
+    return lap[np.abs(g[1:-1, 1:-1] - g[0, 0]) > 0.15].mean()                                # leaf pixels only
+
 def leaf_measurements(img):
     a = img.permute(1, 2, 0).numpy().astype(np.int16)                 # H x W x 3
     bg = a[0, 0]                                                      # flat background colour of this image
@@ -175,7 +180,8 @@ def leaf_measurements(img):
     v = v if v[1] >= 0 else -v                                        # make the axis point down the image
     stem_down = ((v @ c) ** 3).mean() > 0                             # the thin end lies in the downward direction
     return dict(angle=angle, stem_down=stem_down, cx=xs.mean(), cy=ys.mean(),
-                centre_dist=np.hypot(xs.mean() - 63.5, ys.mean() - 63.5), area=mask.mean(), green=a[mask][:, 1].mean())
+                centre_dist=np.hypot(xs.mean() - 63.5, ys.mean() - 63.5), area=mask.mean(), green=a[mask][:, 1].mean(),
+                sharpness=sharpness(img))
 
 meas = pd.DataFrame([leaf_measurements(x) for x in X_all] + [leaf_measurements(x) for x in X_te])
 meas['split'] = ['train'] * len(X_all) + ['test'] * len(X_te)
@@ -197,7 +203,8 @@ summary = pd.DataFrame({
     'stem down, among near-vertical': near.groupby('split').stem_down.mean(),
     'centre distance, median (px)': meas.groupby('split').centre_dist.median(),
     'leaf area, mean': meas.groupby('split').area.mean(),
-    'leaf green, mean': meas.groupby('split').green.mean()})
+    'leaf green, mean': meas.groupby('split').green.mean(),
+    'sharpness, mean': meas.groupby('split').sharpness.mean()})
 display(summary.round(3))
 """)
 
@@ -207,10 +214,10 @@ md(r"""
 * **Training leaves are upright:** about 9 in 10 have their long axis within 30° of vertical, and among those the stem points down in most images. The few exceptions are nearly round leaves, whose "long axis" is ill-defined.
 * **Test leaves are rotated to every angle:** only about 1 in 3 is within 30° of vertical (what uniformly random angles give), and among the near-vertical ones the stem points down only about half the time, so they are upside down as often as not.
 * **No extra shift:** test leaf centres look scattered, but their distance from the image centre is the same as in training. A training leaf's centre sits a few pixels above the image centre (the stem hangs below), and rotating the image about its centre carries that offset round.
-* Leaf size, colour and background are the same in both sets. **The test images look like training images rotated about the image centre, with the uncovered corners filled in the background colour.**
+* Leaf size, colour, background **and sharpness** are the same in both sets. **The test images look like training images rotated about the image centre, with the uncovered corners filled in the background colour and without extra blur.**
 
 **Consequences**
-1. A CNN is not rotation-invariant. Its filters respond to patterns in a particular orientation, so a model trained only on upright leaves can be expected to lose accuracy on rotated ones (tested below: E6 vs E7, P1 vs P2). We **train with random rotations over the full 360°**, filling the corners with the image's own background colour, exactly like the test images.
+1. A CNN is not rotation-invariant. Its filters respond to patterns in a particular orientation, so a model trained only on upright leaves can be expected to lose accuracy on rotated ones (tested below: E6 vs E7, P1 vs P2). We **train with random rotations over the full 360°**, filling the corners with the image's own background colour like the test images, and using bicubic interpolation so that rotated training images stay about as sharp as the test images (section 4 measures this).
 2. A validation set cut from the training images is upright, so its accuracy can overestimate test accuracy. Every experiment therefore also reports accuracy on a **rotated validation set**: the same validation images, each rotated about its centre by a random angle (fixed seed). This is our estimate of test accuracy.
 """)
 
@@ -240,7 +247,7 @@ plt.tight_layout(); plt.show()
 md(r"""
 ## 4. Shared code for all experiments
 * **Split:** stratified, 32 training and 8 validation images per species (480 / 120). The split is fixed for every experiment, so the rows of the log are comparable.
-* **Rotation** (`rotate_shift`): rotates an image about its centre. The corners uncovered by the rotation are filled with that image's own background colour, like the test images. (Implementation detail: we rotate *image − background* with zero padding and add the background back. torchvision's `fill=` option instead left a thin dark seam along the old image edge under bilinear interpolation.)
+* **Rotation** (`rotate_batch`): rotates every image of a batch about its centre, each by its own angle. A 2×3 rotation matrix `theta` per image tells `F.affine_grid` where each output pixel must be read from in the input, and `F.grid_sample` reads those positions with **bicubic** interpolation. Bilinear interpolation would blur the leaves, while the test images are as sharp as the training images; the cell prints the measured sharpness. The corners uncovered by the rotation are filled with the image's own background colour: we rotate *image − background* with zero padding and add the background back.
 * **Rotated validation set:** each validation image rotated by a random angle in [−180°, 180°] (fixed seed).
 * **Augmentation** (training only, a fresh random draw for every image in every epoch): rotation by any angle, plus a left-right mirror half of the time. Neither changes the species.
 * **Test-time augmentation (TTA):** average the predicted probabilities over the 8 rotations/mirrors that map a square image exactly onto itself (0°, 90°, 180°, 270°, each with and without a mirror). These are exact pixel rearrangements, with no interpolation.
@@ -253,25 +260,41 @@ val_idx = np.sort(np.concatenate([rng.choice(np.where(y_all == k)[0], 8, replace
 tr_idx = np.setdiff1d(np.arange(len(y_all)), val_idx)
 X_all_d, X_te_d, y_all_d = X_all.to(DEV), X_te.to(DEV), y_all.to(DEV)
 
-def rotate_shift(x, angle, tx=0, ty=0, flip=False):
-    # x: 3 x H x W float image in [0,1]. Rotate by `angle` degrees about the centre, shift by (tx, ty) pixels,
-    # optionally mirror. Every image has one flat background colour (its top-left pixel); we rotate the
-    # difference from it, so the corners uncovered by the rotation (zero-filled) become exactly that colour.
-    bg = x[:, :1, :1]
-    x = TF.affine(x - bg, angle=angle, translate=[tx, ty], scale=1.0, shear=[0.0, 0.0],
-                  interpolation=InterpolationMode.BILINEAR) + bg
-    x = x.clamp(0, 1)
-    return TF.horizontal_flip(x) if flip else x
+def rotate_batch(x, angles, shift_px=0.0, flip=None, mode='bicubic'):
+    # x: B x 3 x H x W float images in [0,1]; angles: B angles in degrees. Rotates each image about its centre,
+    # optionally shifts it sideways by shift_px pixels and mirrors the images where flip is True.
+    bg = x[:, :, :1, :1]                                   # each image's flat background colour
+    a = torch.deg2rad(angles)
+    cos, sin, zero = torch.cos(a), torch.sin(a), torch.zeros_like(a)
+    shift = torch.full_like(a, -2 * shift_px / x.shape[-1])          # in affine_grid's [-1, 1] coordinates
+    theta = torch.stack([torch.stack([cos, -sin, shift], 1),
+                         torch.stack([sin,  cos, zero], 1)], 1)       # B x 2 x 3 rotation matrices
+    grid = F.affine_grid(theta, list(x.shape), align_corners=False)  # where to read each output pixel from
+    out = F.grid_sample(x - bg, grid, mode=mode, padding_mode='zeros', align_corners=False) + bg
+    out = out.clamp(0, 1)                                  # bicubic can overshoot slightly
+    if flip is not None:
+        out = torch.where(flip.view(-1, 1, 1, 1), out.flip(3), out)
+    return out
 
 def augment(xb):
-    # a fresh random rotation (any angle) and a random mirror for every image in the batch
-    return torch.stack([rotate_shift(x, random.uniform(-180, 180), flip=random.random() < 0.5) for x in xb])
+    # a fresh random rotation (any angle) and a random left-right mirror for every image in the batch
+    angles = torch.empty(len(xb), device=xb.device).uniform_(-180, 180)
+    return rotate_batch(xb, angles, flip=torch.rand(len(xb), device=xb.device) < 0.5)
 
 # ---- validation sets ----
 val_y = y_all_d[val_idx]
 val_x = X_all_d[val_idx].float() / 255                                  # upright
-random.seed(123)
-val_x_rot = torch.stack([rotate_shift(x, random.uniform(-180, 180)) for x in val_x])   # rotated, test-like
+g = torch.Generator().manual_seed(123)
+val_angles = torch.empty(len(val_idx)).uniform_(-180, 180, generator=g).to(DEV)
+val_x_rot = rotate_batch(val_x, val_angles)                             # rotated, test-like
+
+# Why bicubic: sharpness of the leaves (mean |Laplacian|) after rotating the training images both ways
+tr_x = X_all_d[tr_idx].float() / 255
+ang = torch.empty(len(tr_x)).uniform_(-180, 180, generator=g).to(DEV)
+print('mean sharpness  training (upright): %.3f | test: %.3f | training rotated, bilinear: %.3f | training rotated, bicubic: %.3f' % (
+    np.mean([sharpness(x) for x in tr_x]), np.mean([sharpness(x) for x in X_te]),
+    np.mean([sharpness(x) for x in rotate_batch(tr_x, ang, mode='bilinear')]),
+    np.mean([sharpness(x) for x in rotate_batch(tr_x, ang, mode='bicubic')])))
 
 fig, axes = plt.subplots(2, 8, figsize=(14, 3.8))
 for k in range(8):
@@ -497,7 +520,7 @@ md(r"""
 """)
 code(r"""
 angles = list(range(-180, 181, 30))
-rot_sets = {a: torch.stack([rotate_shift(x, a) for x in val_x]) for a in angles}
+rot_sets = {a: rotate_batch(val_x, torch.full((len(val_x),), float(a), device=DEV)) for a in angles}
 fig, ax = plt.subplots(figsize=(8, 3.8))
 for s in ['E6', 'E7']:
     acc = np.array([[accuracy_of(m, rot_sets[a], val_y) for a in angles] for m in RUNS[s]['models']])   # seeds x angles
@@ -507,7 +530,7 @@ for s in ['E6', 'E7']:
 ax.set_xlabel('rotation applied to validation leaves (deg)'); ax.set_ylabel('accuracy (mean ± sd, 3 seeds)')
 ax.set_ylim(0, 1.02); ax.set_xticks(angles); ax.grid(alpha=.3); ax.legend(); ax.set_title('Accuracy vs rotation')
 plt.tight_layout(); plt.show()
-shift_acc = np.array([[accuracy_of(m, torch.stack([rotate_shift(x, 0, tx=d) for x in val_x]), val_y) for d in (0, 5, 10)]
+shift_acc = np.array([[accuracy_of(m, rotate_batch(val_x, torch.zeros(len(val_x), device=DEV), shift_px=d), val_y) for d in (0, 5, 10)]
                       for m in RUNS['E6']['models']])
 print('E6 (no augmentation) accuracy after shifting right by 0 / 5 / 10 px:',
       [f'{a:.3f} ± {b:.3f}' for a, b in zip(shift_acc.mean(0), shift_acc.std(0, ddof=1))])
@@ -646,7 +669,7 @@ md(r"""
 ## References and code sources
 * Starter notebook `LeafID_starter.ipynb` (course material): section 1 is its code, copied unchanged. Its `accuracy` function and its recipe are reused in the two cells after it, and our `SmallCNN` is the starter's network with options to add batch normalisation and change the width.
 * Data: `leaves.zip` provided with the assignment on Classroom (train/, train_labels.csv, test/, sample_submission.csv). No other data was used, apart from the ImageNet-pretrained ResNet-18 weights from torchvision.
-* PyTorch and torchvision documentation (models, `transforms.v2.functional.affine`, optimisers, LR schedulers): https://pytorch.org/docs, https://pytorch.org/vision. NumPy, pandas, matplotlib, Pillow; scikit-learn `confusion_matrix` (Pedregosa et al., *Scikit-learn: Machine Learning in Python*, JMLR 12, 2011).
+* PyTorch and torchvision documentation (`F.affine_grid`, `F.grid_sample`, torchvision models, optimisers, LR schedulers): https://pytorch.org/docs, https://pytorch.org/vision. NumPy, pandas, matplotlib, Pillow; scikit-learn `confusion_matrix` (Pedregosa et al., *Scikit-learn: Machine Learning in Python*, JMLR 12, 2011).
 * K. He, X. Zhang, S. Ren, J. Sun. *Deep Residual Learning for Image Recognition.* CVPR 2016 (ResNet); weights `ResNet18_Weights.IMAGENET1K_V1`.
 * S. Ioffe, C. Szegedy. *Batch Normalization.* ICML 2015.
 * D. P. Kingma, J. Ba. *Adam: A Method for Stochastic Optimization.* ICLR 2015.
