@@ -547,63 +547,77 @@ md(r"""
 
 For comparison (the handout asks for this when a pretrained backbone is used), the **starter's small CNN after all changes (row E11)**: 3 convolutional layers (32/64/128 channels) with batch normalisation, 128 px input standardised with the training mean/std, Adam lr 1e-3, batch 32, 80 epochs with cosine decay, the same augmentation and TTA.
 
-Below: the confusion matrix on the rotated validation set (3 seeds pooled), then misclassified examples.
+Below: confusion matrices on the rotated validation set (3 seeds pooled) for the final model **and** for the starter's small CNN after all changes. The second one has more errors, so it shows better which species get confused. Misclassified examples follow.
 """)
 code(r"""
 from sklearn.metrics import confusion_matrix
-P3 = RUNS['P3']
-print(f"Final config (P3), 3 seeds: validation {np.mean(P3['val']):.3f} ± {sd(P3['val']):.3f}, "
-      f"rotated validation {np.mean(P3['val_rot']):.3f} ± {sd(P3['val_rot']):.3f}")
 yv = val_y.cpu().numpy()
-preds = [predict_proba(m, val_x_rot, tta=True).argmax(1).cpu().numpy() for m in P3['models']]
-cm = confusion_matrix(np.tile(yv, len(preds)), np.concatenate(preds), labels=range(15))
-fig, ax = plt.subplots(figsize=(7.5, 6.5))
-ax.imshow(cm, cmap='Blues')
-for i in range(15):
-    for j in range(15):
-        if cm[i, j]: ax.text(j, i, cm[i, j], ha='center', va='center', fontsize=7, color='w' if cm[i, j] > cm.max() / 2 else 'k')
-ax.set_xticks(range(15)); ax.set_yticks(range(15))
-ax.set_xticklabels([c[-2:] for c in CLASSES]); ax.set_yticklabels(CLASSES, fontsize=8)
-ax.set_xlabel('predicted species'); ax.set_ylabel('true species')
-ax.set_title('Rotated validation set, final config, 3 seeds pooled (8 x 3 = 24 per row)'); plt.tight_layout(); plt.show()
-CONFUSIONS = sorted([(int(cm[i, j]), CLASSES[i], CLASSES[j]) for i in range(15) for j in range(15) if i != j and cm[i, j]], reverse=True)
-print('most frequent confusions (count over 3 seeds, true -> predicted):', CONFUSIONS[:8])
+
+def confusions(step):
+    # predictions of the 3 seed models (with TTA) on the rotated validation set, pooled into one confusion matrix
+    preds = [predict_proba(m, val_x_rot, tta=True).argmax(1).cpu().numpy() for m in RUNS[step]['models']]
+    cm = confusion_matrix(np.tile(yv, len(preds)), np.concatenate(preds), labels=range(15))
+    pairs = sorted([(int(cm[i, j]), CLASSES[i], CLASSES[j]) for i in range(15) for j in range(15) if i != j and cm[i, j]], reverse=True)
+    return preds, cm, pairs
+
+CM = {s: confusions(s) for s in ['P3', SMALL_FINAL]}
+fig, axes = plt.subplots(1, 2, figsize=(15, 6.8))
+for ax, (s, title) in zip(axes, [('P3', 'final model: ResNet-18 (P3)'), (SMALL_FINAL, "starter's small CNN after all changes (E11)")]):
+    cm = CM[s][1]
+    ax.imshow(cm, cmap='Blues')
+    for i in range(15):
+        for j in range(15):
+            if cm[i, j]: ax.text(j, i, cm[i, j], ha='center', va='center', fontsize=7, color='w' if cm[i, j] > cm.max() / 2 else 'k')
+    ax.set_xticks(range(15)); ax.set_yticks(range(15))
+    ax.set_xticklabels([c[-2:] for c in CLASSES]); ax.set_yticklabels(CLASSES, fontsize=8)
+    ax.set_xlabel('predicted species'); ax.set_ylabel('true species')
+    ax.set_title(f'{title}\nrotated validation, 3 seeds pooled (8 x 3 = 24 per row)', fontsize=10)
+plt.tight_layout(); plt.show()
+for s in ['P3', SMALL_FINAL]:
+    p_s, cm_s, pairs_s = CM[s]; n = [int((p != yv).sum()) for p in p_s]
+    print(f'{s}: misclassified rotated validation images per seed {n} (mean {np.mean(n):.1f} ± {sd(n):.1f} of {len(yv)}); '
+          f'most frequent confusions (count, true -> predicted): {pairs_s[:6]}')
+P3 = RUNS['P3']
+preds, cm, CONFUSIONS = CM['P3']
 N_WRONG = [int((p != yv).sum()) for p in preds]
-print(f'misclassified rotated validation images per seed: {N_WRONG} (mean {np.mean(N_WRONG):.1f} ± {sd(N_WRONG):.1f} of {len(yv)})')
+SMALL_CONFUSIONS = CM[SMALL_FINAL][2]
 """)
 md(r"""
-**Misclassified examples.** Each column is one error (from any seed). Top: the rotated image the model saw, with true and predicted species. Middle: the same leaf upright, with the same model's prediction. If the upright leaf is classified correctly, the error is down to orientation. Bottom: a training example of the predicted species, for comparison.
+**Misclassified examples** of the final model, or, if it makes no errors, of the small CNN (E11). Each column is one error (from any seed). Top: the rotated image the model saw, with true and predicted species. Middle: the same leaf upright, with the same model's prediction. If the upright leaf is classified correctly, the error is down to orientation. Bottom: a training example of the predicted species, for comparison.
 """)
 code(r"""
+ERR_STEP = 'P3' if sum(N_WRONG) else SMALL_FINAL          # show the final model's errors, or the small CNN's if it has none
+err_preds, err_models = CM[ERR_STEP][0], RUNS[ERR_STEP]['models']
+print('misclassified examples from:', ERR_STEP)
 shown, seen = [], set()
-for s, p in enumerate(preds):
+for s, p in enumerate(err_preds):
     for k in np.where(p != yv)[0]:
         if k not in seen:
             seen.add(k); shown.append((s, k))
 shown = shown[:8]
 if not shown:   # no errors at all: show the least confident predictions instead
-    conf = torch.stack([predict_proba(m, val_x_rot, tta=True) for m in P3['models']]).mean(0).max(1).values.cpu().numpy()
+    conf = torch.stack([predict_proba(m, val_x_rot, tta=True) for m in err_models]).mean(0).max(1).values.cpu().numpy()
     shown = [(0, k) for k in np.argsort(conf)[:8]]; print('no errors: showing the 8 least confident predictions')
 fig, axes = plt.subplots(3, len(shown), figsize=(2.2 * len(shown), 7.2), squeeze=False)
 for j, (s, k) in enumerate(shown):
-    p_up = predict_proba(P3['models'][s], val_x[k:k + 1], tta=True).argmax(1).item()
-    ex = np.where(y_all.numpy() == preds[s][k])[0][0]
+    p_up = predict_proba(err_models[s], val_x[k:k + 1], tta=True).argmax(1).item()
+    ex = np.where(y_all.numpy() == err_preds[s][k])[0][0]
     axes[0, j].imshow(val_x_rot[k].cpu().permute(1, 2, 0))
-    axes[0, j].set_title(f'seed {s}: true {CLASSES[yv[k]][-2:]}\npred {CLASSES[preds[s][k]][-2:]}', fontsize=8, color='r')
+    axes[0, j].set_title(f'seed {s}: true {CLASSES[yv[k]][-2:]}\npred {CLASSES[err_preds[s][k]][-2:]}', fontsize=8, color='r')
     axes[1, j].imshow(val_x[k].cpu().permute(1, 2, 0)); axes[1, j].set_title(f'upright: pred {CLASSES[p_up][-2:]}', fontsize=8)
-    axes[2, j].imshow(X_all[ex].permute(1, 2, 0)); axes[2, j].set_title(f'a training {CLASSES[preds[s][k]][-2:]}', fontsize=8)
+    axes[2, j].imshow(X_all[ex].permute(1, 2, 0)); axes[2, j].set_title(f'a training {CLASSES[err_preds[s][k]][-2:]}', fontsize=8)
 for a in axes.flat: a.axis('off')
-plt.suptitle('Errors: as seen (top), same leaf upright (middle), a training leaf of the predicted species (bottom)')
+plt.suptitle(f'{ERR_STEP} errors: as seen (top), same leaf upright (middle), a training leaf of the predicted species (bottom)')
 plt.tight_layout(); plt.show()
 
 # Over all errors of all 3 seeds: is the same leaf classified correctly when upright?
 ORIENT_ERR, ALL_ERR = 0, 0
-for s, p in enumerate(preds):
+for s, p in enumerate(err_preds):
     wrong = np.where(p != yv)[0]
     if len(wrong):
-        up = predict_proba(P3['models'][s], val_x[wrong], tta=True).argmax(1).cpu().numpy()
+        up = predict_proba(err_models[s], val_x[wrong], tta=True).argmax(1).cpu().numpy()
         ORIENT_ERR += int((up == yv[wrong]).sum()); ALL_ERR += len(wrong)
-print(f'of {ALL_ERR} errors (3 seeds pooled), {ORIENT_ERR} are classified correctly when the leaf is upright '
+print(f'{ERR_STEP}: of {ALL_ERR} errors (3 seeds pooled), {ORIENT_ERR} are classified correctly when the leaf is upright '
       f'(errors caused by orientation); {ALL_ERR - ORIENT_ERR} are wrong even upright (caused by the leaf itself)')
 """)
 md(r"""
@@ -647,7 +661,7 @@ for s in steps:
 print(f"Augmentation effect, small CNN (E6 -> E7), rotated val: {ms(R['E6']['val_rot'])} -> {ms(R['E7']['val_rot'])}")
 print(f"Augmentation effect, ResNet-18 (P1 -> P2), rotated val: {ms(R['P1']['val_rot'])} -> {ms(R['P2']['val_rot'])}")
 print(f"Small CNN final (E11) vs ResNet-18 final (P3), rotated val: {ms(R['E11']['val_rot'])} vs {ms(R['P3']['val_rot'])}")
-print('Most frequent confusions of the final config:', CONFUSIONS[:4])
+print('Most frequent confusions, final model (P3):', CONFUSIONS[:4], '| small CNN (E11):', SMALL_CONFUSIONS[:4])
 print(f'Total run time: {(time.time() - T_START) / 60:.1f} min')
 
 first_learns = next((s for s in steps if np.mean(R[s]['val']) > 0.3), None)
@@ -660,8 +674,9 @@ print(f"* Without rotation augmentation (E6), upright vs rotated validation: {np
 print(f"* Pretrained ResNet-18 without augmentation (P1), upright vs rotated: {np.mean(R['P1']['val']):.3f} vs {np.mean(R['P1']['val_rot']):.3f}; "
       f"with augmentation (P2) rotated: {np.mean(R['P2']['val_rot']):.3f}; with TTA (P3): {np.mean(R['P3']['val_rot']):.3f}.")
 print(f"* Starter's small CNN after all changes (E11), rotated validation: {ms(R['E11']['val_rot'])}.")
-print(f"* Final errors: {ALL_ERR} over 3 seeds x 120 images, {ORIENT_ERR} of them due to orientation; most confused pairs: "
-      + ', '.join(f'{a[-2:]}->{b[-2:]} ({n})' for n, a, b in CONFUSIONS[:3]) + '.')
+print(f"* Final model (P3) errors on rotated validation: {sum(N_WRONG)} over 3 seeds x 120 images.")
+print(f"* Small CNN (E11) most confused pairs (count over 3 seeds): " + ', '.join(f'{a[-2:]}->{b[-2:]} ({n})' for n, a, b in SMALL_CONFUSIONS[:4])
+      + f"; of the {ERR_STEP} errors, {ORIENT_ERR} of {ALL_ERR} disappear when the leaf is upright.")
 """)
 md(r"""
 *(Written interpretation: added after the Colab run.)*
